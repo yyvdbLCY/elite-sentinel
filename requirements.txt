@@ -1,0 +1,6 @@
+yfinance
+mplfinance
+openai
+feedparser
+requests
+google-generativeai
