@@ -39,6 +39,17 @@ def get_recent_data(symbol):
         vol_ratio = 1.0
     return hist, vol_ratio
 
+# ====== 新增函數 START ======
+def get_stock_name(symbol):
+    """從 yfinance 取得股票簡稱，失敗則返回空字串"""
+    try:
+        ticker = yf.Ticker(symbol)
+        name = ticker.info.get('shortName') or ticker.info.get('longName') or ''
+        return name
+    except:
+        return ''
+# ====== 新增函數 END ======
+
 def generate_chart_b64(symbol, hist):
     """生成 K 線圖並轉 base64"""
     buf = io.BytesIO()
@@ -157,6 +168,10 @@ def main():
             if hist is None:
                 continue
 
+            # ====== 新增：取得股票名稱 ======
+            stock_name = get_stock_name(symbol)
+            # ==============================
+
             # 1. DeepSeek 初判
             initial = deepseek_judge_alert(symbol, hist, vol_ratio)
             if not initial.get("alert"):
@@ -164,7 +179,7 @@ def main():
 
             # 2. Gemini 視覺（若有）
             gemini_vision = None
-            if gemini_client:
+            if gemini_model:
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
                     gemini_vision = gemini_vision_analysis(img_b64, symbol)
@@ -194,8 +209,13 @@ def main():
 
             # 5. 組裝結構化推送
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+
+            # ====== 新增：組合顯示名稱 ======
+            display_title = f"{symbol} {stock_name}" if stock_name else symbol
+            # ==============================
+
             message = f"""
-🚨 *【{symbol}】異動預警* | 置信度：{final['confidence']}%
+🚨 *【{display_title}】異動預警* | 置信度：{final['confidence']}%
 
 📊 *信號拆解*
   ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
