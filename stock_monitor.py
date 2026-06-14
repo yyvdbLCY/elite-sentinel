@@ -5,7 +5,13 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-STOCKS = os.environ["STOCK_LIST"].split(",")
+def load_stock_list(filepath="stocks.txt"):
+    """從 stocks.txt 讀取監控清單，每行一個代碼，忽略空行與 # 註解"""
+    with open(filepath, "r") as f:
+        lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    return lines
+
+STOCKS = load_stock_list()
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
