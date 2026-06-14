@@ -163,7 +163,7 @@ def deepseek_sentiment(symbol, news_items):
         messages=[{"role":"user","content":prompt}],
         temperature=0.2
     )
-    return resp.choices[0].message.content ban
+    return resp.choices[0].message.content
 
 def send_telegram(text):
     """發送 Telegram 訊息"""
