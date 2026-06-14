@@ -6,16 +6,19 @@ from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
 def load_stock_list(filepath="stocks.txt"):
-    """從 stocks.txt 讀取監控清單，每行一個代碼，忽略空行與 # 註解"""
     with open(filepath, "r") as f:
         lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
     return lines
 
 STOCKS = load_stock_list()
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+# Gemini 視覺調用閾值（僅在置信度極高或極低時才看圖）
+GEMINI_CONFIDENCE_HIGH = 80
+GEMINI_CONFIDENCE_LOW = 40
 
 # 初始化 AI 客戶端
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
@@ -37,7 +40,6 @@ def get_recent_data(symbol):
     if hist.empty:
         return None, None
 
-    # 成交量異常檢測：最後一小時 vs 過去20小時均值
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
@@ -47,7 +49,6 @@ def get_recent_data(symbol):
     return hist, vol_ratio
 
 def get_stock_name(symbol):
-    """從 yfinance 取得股票簡稱，失敗則返回空字串"""
     try:
         ticker = yf.Ticker(symbol)
         name = ticker.info.get('shortName') or ticker.info.get('longName') or ''
@@ -56,15 +57,14 @@ def get_stock_name(symbol):
         return ''
 
 def generate_chart_b64(symbol, hist):
-    """生成 K 線圖並轉 base64"""
     buf = io.BytesIO()
     mpf.plot(hist.tail(50), type='candle', style='charles',
-             volume=True, savefig=buf, figsize=(10,5))
+             volume=True, savefig=dict(fname=buf, format='jpg', dpi=100, bbox_inches='tight'),
+             figsize=(10,5))
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
 
 def deepseek_judge_alert(symbol, hist, vol_ratio):
-    """DeepSeek 初始判斷：是否異動 + 支撐壓力 + 置信度 + 風險"""
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     prompt = f"""你是頂級交易員。以下是 {symbol} 近 24 小時數據：
 {data_text}
@@ -86,17 +86,27 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     return json.loads(resp.choices[0].message.content)
 
 def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖，尋找騙線信號"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
     resp = gemini_model.generate_content([
         prompt,
-        {"inline_data": {"mime_type":"image/png", "data": img_b64}}
+        {"inline_data": {"mime_type":"image/jpeg", "data": img_b64}}
     ])
     return resp.text
 
+def call_gemini_with_retry(img_b64, symbol, max_retries=2):
+    """帶重試與降級的 Gemini 調用"""
+    for attempt in range(max_retries):
+        try:
+            return gemini_vision_analysis(img_b64, symbol)
+        except Exception as e:
+            print(f"Gemini 視覺嘗試 {attempt+1}/{max_retries} 失敗：{e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))  # 指數退避
+    # 降級：返回 None，由主流程處理
+    return None
+
 def deepseek_debate(symbol, initial_judge, gemini_vision):
-    """雙模型辯論：DeepSeek 參考 Gemini 視覺後修正結論"""
     debate_prompt = f"""你之前對 {symbol} 的判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
 
@@ -125,7 +135,6 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     return json.loads(resp.choices[0].message.content)
 
 def search_news(symbol):
-    """Google News RSS 標題"""
     url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
     feed = feedparser.parse(url)
     items = [{"title": e.title, "link": e.link} for e in feed.entries[:5]]
@@ -144,7 +153,6 @@ def deepseek_sentiment(symbol, news_items):
     return resp.choices[0].message.content
 
 def send_telegram(text):
-    """發送 Telegram 訊息"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
@@ -163,27 +171,35 @@ def main():
             if not initial.get("alert"):
                 continue
 
-            # 2. Gemini 視覺（若有）
+            # 2. 決定是否調用 Gemini（置信度極高或極低才看圖）
+            confidence = initial.get("confidence", 50)
+            use_gemini = (gemini_model is not None and
+                          (confidence >= GEMINI_CONFIDENCE_HIGH or
+                           confidence <= GEMINI_CONFIDENCE_LOW))
+
             gemini_vision = None
-            if gemini_model:
+            if use_gemini:
+                # 強制間隔 4 秒，防止連續請求觸發限流
+                time.sleep(4)
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
-                    gemini_vision = gemini_vision_analysis(img_b64, symbol)
+                    gemini_vision = call_gemini_with_retry(img_b64, symbol)
                 except Exception as e:
-                    print(f"Gemini 視覺失敗: {e}")
+                    print(f"Gemini 圖形生成或分析失敗：{e}")
 
-            # 3. 雙模型辯論（若有 Gemini 結果，否則直接使用初判）
+            # 3. 雙模型辯論（若有有效 Gemini 結果）
             if gemini_vision:
                 final = deepseek_debate(symbol, initial, gemini_vision)
             else:
-                # 無 Gemini 時模擬統一格式
+                # 純文字模式，直接基於初判建構結論
+                visual_info = "未啟用視覺分析" if not use_gemini else "視覺分析暫時不可用"
                 final = {
                     "action": "HOLD",
-                    "confidence": initial.get("confidence", 70),
+                    "confidence": confidence,
                     "signal_breakdown": {
                         "price_action": initial.get("reason", ""),
                         "volume_confirmation": f"成交量倍數 {vol_ratio:.1f}",
-                        "visual_pattern": "未啟用視覺分析"
+                        "visual_pattern": visual_info
                     },
                     "risk_factors": initial.get("risk_factors", []),
                     "suggestion": "請結合其他資訊人工判斷"
