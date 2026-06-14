@@ -17,62 +17,23 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Gemini 視覺調用閾值（僅在置信度極高或極低時才看圖）
-GEMINI_CONFIDENCE_HIGH = 80
-GEMINI_CONFIDENCE_LOW = 40
-
 # 初始化 DeepSeek
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
-# ==================== Gemini 終極穩定初始化 ====================
+# ==================== Gemini 穩定初始化 ====================
 gemini_model = None
 if GEMINI_KEY:
     print("偵測到 Gemini API Key，開始初始化...")
-    genai_lib = None
     try:
         import google.generativeai as genai
-        genai_lib = genai
-        print("成功導入 google.generativeai")
-    except Exception as e1:
-        print(f"導入 google.generativeai 失敗：{e1}")
-        try:
-            import genai
-            genai_lib = genai
-            print("改為導入 genai 成功")
-        except Exception as e2:
-            print(f"導入 genai 亦失敗：{e2}")
-
-    if genai_lib:
-        try:
-            genai_lib.configure(api_key=GEMINI_KEY)
-            # 自動掃描可用的視覺模型
-            available_models = []
-            for m in genai_lib.list_models():
-                if 'generateContent' in m.supported_generation_methods and 'vision' in m.name:
-                    available_models.append(m.name)
-            print(f"可用視覺模型清單：{available_models}")
-
-            # 優先順序：gemini-2.0-flash > gemini-1.5-flash > 其他
-            preferred = ['models/gemini-2.0-flash', 'models/gemini-1.5-flash']
-            chosen = None
-            for p in preferred:
-                if p in available_models:
-                    chosen = p
-                    break
-            if not chosen and available_models:
-                chosen = available_models[0]   # 選第一個可用的視覺模型
-
-            if chosen:
-                # 去除 "models/" 前綴，因為 GenerativeModel 接受不帶前綴的名稱
-                model_name = chosen.replace('models/', '')
-                gemini_model = genai_lib.GenerativeModel(model_name)
-                print(f"✅ Gemini 視覺模組已啟動，使用模型：{model_name}")
-            else:
-                print("❌ 找不到任何可用的視覺模型，視覺分析將停用")
-        except Exception as e:
-            print(f"❌ Gemini 配置失敗：{e}")
-    else:
-        print("❌ 未找到任何可用的 Google Generative AI SDK，視覺分析將停用")
+        genai.configure(api_key=GEMINI_KEY)
+        
+        # 直接指定最新主流的免費多模態模型，不再透過 'vision' 關鍵字盲目篩選
+        model_name = 'gemini-2.0-flash'
+        gemini_model = genai.GenerativeModel(model_name)
+        print(f"✅ Gemini 視覺模組已啟動，使用模型：{model_name}")
+    except Exception as e:
+        print(f"❌ Gemini 配置失敗：{e}")
 else:
     print("未設定 GEMINI_API_KEY，跳過視覺模組")
 
@@ -202,7 +163,7 @@ def deepseek_sentiment(symbol, news_items):
         messages=[{"role":"user","content":prompt}],
         temperature=0.2
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content ban
 
 def send_telegram(text):
     """發送 Telegram 訊息"""
@@ -225,9 +186,9 @@ def main():
                 continue
 
             confidence = initial.get("confidence", 50)
-            use_gemini = (gemini_model is not None and
-                          (confidence >= GEMINI_CONFIDENCE_HIGH or
-                           confidence <= GEMINI_CONFIDENCE_LOW))
+            
+            # 修改：只要 Gemini 初始化成功，就一律啟用視覺分析，不再受置信度區間限制
+            use_gemini = (gemini_model is not None)
 
             gemini_vision = None
             if use_gemini:
@@ -243,7 +204,7 @@ def main():
             if gemini_vision:
                 final = deepseek_debate(symbol, initial, gemini_vision)
             else:
-                # 純文字模式，使用 DeepSeek 初判的具體建議
+                # 純文字模式
                 visual_info = "未啟用視覺分析" if not use_gemini else "視覺分析暫時不可用"
                 final = {
                     "action": initial.get("action", "HOLD"),
