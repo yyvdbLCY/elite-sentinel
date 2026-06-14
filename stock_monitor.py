@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 # ==================== 配置 ====================
 with open("stocks.txt", "r") as f:
     STOCKS = [line.strip() for line in f if line.strip()]
+
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -14,11 +15,12 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 初始化 AI 客戶端
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
-gemini_model = None
+
+# Gemini 使用新版 google.genai（取代棄用嘅 generativeai）
+gemini_client = None
 if GEMINI_KEY:
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    from google import genai
+    gemini_client = genai.Client(api_key=GEMINI_KEY)
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -68,14 +70,17 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     return json.loads(resp.choices[0].message.content)
 
 def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖，尋找騙線信號"""
+    """Gemini 視覺看圖（使用新版 genai SDK）"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
-    resp = gemini_model.generate_content([
-        prompt,
-        {"inline_data": {"mime_type":"image/png", "data": img_b64}}
-    ])
-    return resp.text
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            prompt,
+            {"inline_data": {"mime_type":"image/png", "data": img_b64}}
+        ]
+    )
+    return response.text
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """雙模型辯論：DeepSeek 參考 Gemini 視覺後修正結論"""
@@ -126,9 +131,23 @@ def deepseek_sentiment(symbol, news_items):
     return resp.choices[0].message.content
 
 def send_telegram(text):
-    """發送 Telegram 訊息"""
+    """發送 Telegram 訊息（含錯誤處理）"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    try:
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+    except Exception as e:
+        # 如果 Markdown 解析失敗，嘗試純文字重發
+        try:
+            requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text
+            }, timeout=10)
+        except:
+            print(f"Telegram 推送失敗: {e}")
 
 # ==================== 主流程 ====================
 def main():
@@ -145,7 +164,7 @@ def main():
 
             # 2. Gemini 視覺（若有）
             gemini_vision = None
-            if gemini_model:
+            if gemini_client:
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
                     gemini_vision = gemini_vision_analysis(img_b64, symbol)
