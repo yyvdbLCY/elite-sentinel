@@ -5,7 +5,8 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-STOCKS = os.environ["STOCK_LIST"].split(",")
+with open("stocks.txt", "r") as f:
+    STOCKS = [line.strip() for line in f if line.strip()]
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
