@@ -64,11 +64,11 @@ def get_stock_name(symbol):
         return ''
 
 def generate_chart_b64(symbol, hist):
-    """生成 K 線圖並轉 base64（JPEG 格式，體積小速度快）"""
+    """生成 K 線圖並轉 base64（降低 DPI 減少 Token 消耗）"""
     buf = io.BytesIO()
     mpf.plot(hist.tail(50), type='candle', style='charles',
              volume=True,
-             savefig=dict(fname=buf, format='jpg', dpi=100, bbox_inches='tight'),
+             savefig=dict(fname=buf, format='jpg', dpi=65, bbox_inches='tight'), # 改為 65
              figsize=(10,5))
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
@@ -187,9 +187,8 @@ def main():
 
             confidence = initial.get("confidence", 50)
             
-            # 修改：只要 Gemini 初始化成功，就一律啟用視覺分析，不再受置信度區間限制
-            use_gemini = (gemini_model is not None)
-
+# 只有當 DeepSeek 的置信度大於等於 70% 時，才讓 Gemini 幫忙雙重確認
+            use_gemini = (gemini_model is not None and confidence >= 70)
             gemini_vision = None
             if use_gemini:
                 # 強制間隔 4 秒，防止連續請求觸發限流
