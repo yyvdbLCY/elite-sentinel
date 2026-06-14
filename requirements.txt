@@ -3,4 +3,4 @@ mplfinance
 openai
 feedparser
 requests
-google-genai
+google-generativeai
