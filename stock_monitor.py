@@ -5,9 +5,7 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-with open("stocks.txt", "r") as f:
-    STOCKS = [line.strip() for line in f if line.strip()]
-
+STOCKS = os.environ["STOCK_LIST"].split(",")
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -15,12 +13,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 初始化 AI 客戶端
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
-
-# Gemini 使用新版 google.genai（取代棄用嘅 generativeai）
-gemini_client = None
+gemini_model = None
 if GEMINI_KEY:
-    from google import genai
-    gemini_client = genai.Client(api_key=GEMINI_KEY)
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_KEY)
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -39,7 +36,6 @@ def get_recent_data(symbol):
         vol_ratio = 1.0
     return hist, vol_ratio
 
-# ====== 新增函數 START ======
 def get_stock_name(symbol):
     """從 yfinance 取得股票簡稱，失敗則返回空字串"""
     try:
@@ -48,7 +44,6 @@ def get_stock_name(symbol):
         return name
     except:
         return ''
-# ====== 新增函數 END ======
 
 def generate_chart_b64(symbol, hist):
     """生成 K 線圖並轉 base64"""
@@ -81,17 +76,14 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     return json.loads(resp.choices[0].message.content)
 
 def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖（使用新版 genai SDK）"""
+    """Gemini 視覺看圖，尋找騙線信號"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
-    response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            prompt,
-            {"inline_data": {"mime_type":"image/png", "data": img_b64}}
-        ]
-    )
-    return response.text
+    resp = gemini_model.generate_content([
+        prompt,
+        {"inline_data": {"mime_type":"image/png", "data": img_b64}}
+    ])
+    return resp.text
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """雙模型辯論：DeepSeek 參考 Gemini 視覺後修正結論"""
@@ -142,23 +134,9 @@ def deepseek_sentiment(symbol, news_items):
     return resp.choices[0].message.content
 
 def send_telegram(text):
-    """發送 Telegram 訊息（含錯誤處理）"""
+    """發送 Telegram 訊息"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown"
-        }, timeout=10)
-    except Exception as e:
-        # 如果 Markdown 解析失敗，嘗試純文字重發
-        try:
-            requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text
-            }, timeout=10)
-        except:
-            print(f"Telegram 推送失敗: {e}")
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 # ==================== 主流程 ====================
 def main():
@@ -168,9 +146,7 @@ def main():
             if hist is None:
                 continue
 
-            # ====== 新增：取得股票名稱 ======
             stock_name = get_stock_name(symbol)
-            # ==============================
 
             # 1. DeepSeek 初判
             initial = deepseek_judge_alert(symbol, hist, vol_ratio)
@@ -209,11 +185,7 @@ def main():
 
             # 5. 組裝結構化推送
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
-
-            # ====== 新增：組合顯示名稱 ======
             display_title = f"{symbol} {stock_name}" if stock_name else symbol
-            # ==============================
-
             message = f"""
 🚨 *【{display_title}】異動預警* | 置信度：{final['confidence']}%
 
