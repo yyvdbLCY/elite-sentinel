@@ -21,9 +21,13 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 gemini_model = None
 if GEMINI_KEY:
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_KEY)
+        gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    except Exception as e:
+        print(f"Gemini 初始化失敗，將停用視覺分析：{e}")
+        gemini_model = None
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
