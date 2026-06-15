@@ -2,7 +2,7 @@ name: 精銳哨兵監控
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # 每5分鐘運行一次（UTC）
+    - cron: '*/15 * * * *'   # 每15分鐘運行一次（UTC）
   workflow_dispatch:
 
 jobs:
