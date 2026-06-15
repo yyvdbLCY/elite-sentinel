@@ -285,7 +285,7 @@ def main():
 
             confidence = initial.get("confidence", 50)
             gemini_vision = None
-            if gemini_client and confidence >= 70:
+            if False and confidence >= 70:
                 if not should_skip_gemini(symbol, hist):
                     try:
                         img_b64 = generate_chart_b64(symbol, hist)
