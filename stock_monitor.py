@@ -5,72 +5,19 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-def load_stock_list(filepath="stocks.txt"):
-    """從 stocks.txt 讀取監控清單，每行一個代碼，忽略空行與 # 註解"""
-    with open(filepath, "r") as f:
-        lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    return lines
-
-STOCKS = load_stock_list()
+STOCKS = os.environ["STOCK_LIST"].split(",")
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# 初始化 DeepSeek
+# 初始化 AI 客戶端
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
-
-# ==================== Gemini 多 Key 輪詢模組 ====================
-def load_gemini_keys():
-    keys_str = os.environ.get("GEMINI_API_KEYS", "")
-    if not keys_str:
-        return []
-    return [k.strip() for k in keys_str.split(",") if k.strip()]
-
-class GeminiRotator:
-    def __init__(self, keys, model_name='gemini-2.0-flash'):
-        if not keys:
-            raise ValueError("至少需要一個 Gemini API Key")
-        self.keys = keys
-        self.idx = 0
-        import google.generativeai as genai
-        self.genai = genai
-        self.model = self.genai.GenerativeModel(model_name)
-        print(f"✅ Gemini 多 Key 輪詢已啟動，共 {len(keys)} 組 Key，模型：{model_name}")
-
-    def generate_with_retry(self, prompt, img_b64, max_retries=None):
-        if max_retries is None:
-            max_retries = len(self.keys) * 2
-        for attempt in range(max_retries):
-            key = self.keys[self.idx]
-            self.genai.configure(api_key=key)
-            try:
-                response = self.model.generate_content([
-                    prompt,
-                    {"inline_data": {"mime_type":"image/jpeg", "data": img_b64}}
-                ])
-                return response.text
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    print(f"Gemini Key {key[:8]}... 達上限 (429)，切換下一個。")
-                    self.idx = (self.idx + 1) % len(self.keys)
-                    wait = 10 + (attempt * 5)
-                    print(f"等待 {wait} 秒後重試...")
-                    time.sleep(wait)
-                else:
-                    raise
-        raise RuntimeError("所有 Gemini Key 都已達上限，請稍後再試。")
-
-gemini_rotator = None
-gemini_keys = load_gemini_keys()
-if gemini_keys:
-    print("偵測到 Gemini API Keys，開始初始化多 Key 輪詢...")
-    try:
-        gemini_rotator = GeminiRotator(gemini_keys)
-    except Exception as e:
-        print(f"❌ Gemini 多 Key 輪詢配置失敗：{e}")
-else:
-    print("未設定 GEMINI_API_KEYS，跳過視覺模組")
+gemini_model = None
+if GEMINI_KEY:
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_KEY)
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -80,6 +27,7 @@ def get_recent_data(symbol):
     if hist.empty:
         return None, None
 
+    # 成交量異常檢測：最後一小時 vs 過去20小時均值
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
@@ -88,27 +36,16 @@ def get_recent_data(symbol):
         vol_ratio = 1.0
     return hist, vol_ratio
 
-def get_stock_name(symbol):
-    """從 yfinance 取得股票簡稱，失敗則返回空字串"""
-    try:
-        ticker = yf.Ticker(symbol)
-        name = ticker.info.get('shortName') or ticker.info.get('longName') or ''
-        return name
-    except:
-        return ''
-
 def generate_chart_b64(symbol, hist):
-    """生成 K 線圖並轉 base64（降低 DPI 減少 Token 消耗）"""
+    """生成 K 線圖並轉 base64"""
     buf = io.BytesIO()
     mpf.plot(hist.tail(50), type='candle', style='charles',
-             volume=True,
-             savefig=dict(fname=buf, format='jpg', dpi=65, bbox_inches='tight'),
-             figsize=(10,5))
+             volume=True, savefig=buf, figsize=(10,5))
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
 
 def deepseek_judge_alert(symbol, hist, vol_ratio):
-    """DeepSeek 初始判斷：是否異動 + 支撐壓力 + 置信度 + 風險 + 操作建議"""
+    """DeepSeek 初始判斷：是否異動 + 支撐壓力 + 置信度 + 風險"""
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     prompt = f"""你是頂級交易員。以下是 {symbol} 近 24 小時數據：
 {data_text}
@@ -117,10 +54,9 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
 請判斷是否出現需要提醒的異動（普通小波動忽略）。僅當出現放量突破、斷崖下跌、關鍵反轉等非正常邏輯時，才標記 alert: true。
 推算關鍵支撐位和壓力位。
 輸出你的判斷置信度（0-100%），並列出可能讓你誤判的 3 個風險因素。
-同時請給出明確的操作建議（action + suggestion），例如：若回踩支撐站穩可輕倉買入，止損設於何處，目標看至何處。
 
 嚴格輸出 JSON：
-{{"alert": true/false, "reason":"...", "support": 支撐價, "resistance": 壓力價, "confidence": 85, "action": "BUY/SELL/HOLD", "suggestion": "具體操作建議（含入場、止損、目標）", "risk_factors": ["風險1","風險2","風險3"]}}"""
+{{"alert": true/false, "reason":"...", "support": 支撐價, "resistance": 壓力價, "confidence": 85, "risk_factors": ["風險1","風險2","風險3"]}}"""
 
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -131,18 +67,14 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     return json.loads(resp.choices[0].message.content)
 
 def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖（透過多 Key 輪詢）"""
+    """Gemini 視覺看圖，尋找騙線信號"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
-    return gemini_rotator.generate_with_retry(prompt, img_b64)
-
-def call_gemini_with_retry(img_b64, symbol, max_retries=2):
-    """保留相容介面，實際由 GeminiRotator 處理重試與切換"""
-    try:
-        return gemini_vision_analysis(img_b64, symbol)
-    except Exception as e:
-        print(f"Gemini 視覺分析最終失敗：{e}")
-        return None
+    resp = gemini_model.generate_content([
+        prompt,
+        {"inline_data": {"mime_type":"image/png", "data": img_b64}}
+    ])
+    return resp.text
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """雙模型辯論：DeepSeek 參考 Gemini 視覺後修正結論"""
@@ -163,7 +95,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     "visual_pattern": "..."
   }},
   "risk_factors": ["..."],
-  "suggestion": "給交易員的一句明確建議（含入場、止損、目標）"
+  "suggestion": "給交易員的一句明確建議"
 }}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -205,43 +137,35 @@ def main():
             if hist is None:
                 continue
 
-            stock_name = get_stock_name(symbol)
-
             # 1. DeepSeek 初判
             initial = deepseek_judge_alert(symbol, hist, vol_ratio)
             if not initial.get("alert"):
                 continue
 
-            confidence = initial.get("confidence", 50)
-            
-            # 只有當 DeepSeek 的置信度大於等於 70% 且 Gemini 輪詢器可用時，才進行視覺分析
-            use_gemini = (gemini_rotator is not None and confidence >= 70)
+            # 2. Gemini 視覺（若有）
             gemini_vision = None
-            if use_gemini:
-                # 強制間隔 4 秒，防止連續請求觸發限流
-                time.sleep(4)
+            if gemini_model:
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
-                    gemini_vision = call_gemini_with_retry(img_b64, symbol)
+                    gemini_vision = gemini_vision_analysis(img_b64, symbol)
                 except Exception as e:
-                    print(f"Gemini 圖形生成或分析失敗：{e}")
+                    print(f"Gemini 視覺失敗: {e}")
 
-            # 3. 雙模型辯論（若有有效 Gemini 結果）
+            # 3. 雙模型辯論（若有 Gemini 結果，否則直接使用初判）
             if gemini_vision:
                 final = deepseek_debate(symbol, initial, gemini_vision)
             else:
-                # 純文字模式
-                visual_info = "未啟用視覺分析" if not use_gemini else "視覺分析暫時不可用"
+                # 無 Gemini 時模擬統一格式
                 final = {
-                    "action": initial.get("action", "HOLD"),
-                    "confidence": confidence,
+                    "action": "HOLD",
+                    "confidence": initial.get("confidence", 70),
                     "signal_breakdown": {
                         "price_action": initial.get("reason", ""),
                         "volume_confirmation": f"成交量倍數 {vol_ratio:.1f}",
-                        "visual_pattern": visual_info
+                        "visual_pattern": "未啟用視覺分析"
                     },
                     "risk_factors": initial.get("risk_factors", []),
-                    "suggestion": initial.get("suggestion", "請結合其他資訊人工判斷")
+                    "suggestion": "請結合其他資訊人工判斷"
                 }
 
             # 4. 新聞情緒
@@ -250,9 +174,8 @@ def main():
 
             # 5. 組裝結構化推送
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
-            display_title = f"{symbol} {stock_name}" if stock_name else symbol
             message = f"""
-🚨 *【{display_title}】異動預警* | 置信度：{final['confidence']}%
+🚨 *【{symbol}】異動預警* | 置信度：{final['confidence']}%
 
 📊 *信號拆解*
   ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
