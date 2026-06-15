@@ -93,25 +93,30 @@ def gemini_vision_analysis(img_b64, symbol):
     return resp.text
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
-    """雙模型辯論：DeepSeek 參考 Gemini 視覺後修正結論"""
+    """最終決策：優先參考 Gemini 視覺，若無則由 DeepSeek 獨立給出具體建議"""
+    
+    # 動態調整提示詞：有視覺就辯論，沒視覺就單獨總結
+    if gemini_vision:
+        expert_input = f"另一位專家（Gemini 視覺）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
+    else:
+        expert_input = "系統暫無視覺分析數據。請你僅基於上述量價數據（包含支撐壓力與異動原因），獨立給出最終的交易決策與具體建議。"
+
     debate_prompt = f"""你之前對 {symbol} 的判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
 
-另一位專家（Gemini 視覺）看完 K 線圖後指出：
-{gemini_vision}
+{expert_input}
 
-請你仔細思考 Gemini 的觀察是否動搖你的判斷。
-輸出修正後的最終結論，嚴格 JSON 格式：
+輸出最終結論，嚴格 JSON 格式：
 {{
   "action": "BUY/SELL/HOLD",
   "confidence": 0-100,
   "signal_breakdown": {{
     "price_action": "...",
     "volume_confirmation": "...",
-    "visual_pattern": "..."
+    "visual_pattern": "若無視覺分析請填寫'無視覺數據，基於純量價分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "給交易員的一句明確建議"
+  "suggestion": "給交易員的一句明確建議（必須具體，例如：量縮回踩，建議等待突破xx元再介入，或跌破xx元止損）"
 }}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -165,24 +170,9 @@ def main():
                     img_b64 = generate_chart_b64(symbol, hist)
                     gemini_vision = gemini_vision_analysis(img_b64, symbol)
                 except Exception as e:
-                    print(f"Gemini 視覺失敗: {e}")
-
-            # 3. 雙模型辯論（若有 Gemini 結果，否則直接使用初判）
-            if gemini_vision:
-                final = deepseek_debate(symbol, initial, gemini_vision)
-            else:
-                # 無 Gemini 時模擬統一格式
-                final = {
-                    "action": "HOLD",
-                    "confidence": initial.get("confidence", 70),
-                    "signal_breakdown": {
-                        "price_action": initial.get("reason", ""),
-                        "volume_confirmation": f"成交量倍數 {vol_ratio:.1f}",
-                        "visual_pattern": "未啟用視覺分析"
-                    },
-                    "risk_factors": initial.get("risk_factors", []),
-                    "suggestion": "請結合其他資訊人工判斷"
-                }
+                    
+# 3. 最終決策（將視覺結果傳給 DeepSeek，若無則傳 None 讓其根據量價自行判斷）
+            final = deepseek_debate(symbol, initial, gemini_vision)
 
             # 4. 新聞情緒
             news = search_news(symbol)
