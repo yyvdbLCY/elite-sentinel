@@ -5,7 +5,9 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-STOCKS = os.environ["STOCK_LIST"].split(",")
+# 修復 1：過濾掉空字串並去除多餘空格，避免 "Empty ticker name" 錯誤
+STOCKS = [s.strip() for s in os.environ.get("STOCK_LIST", "").split(",") if s.strip()]
+
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -13,11 +15,13 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 初始化 AI 客戶端
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
-gemini_model = None
+
+# 修復 2：更新為最新的 google-genai SDK 寫法
+gemini_client = None
 if GEMINI_KEY:
-    import google.generativeai as genai
-    genai.configure(api_key=GEMINI_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    from google import genai
+    from google.genai import types
+    gemini_client = genai.Client(api_key=GEMINI_KEY)
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -37,10 +41,14 @@ def get_recent_data(symbol):
     return hist, vol_ratio
 
 def generate_chart_b64(symbol, hist):
-    """生成 K 線圖並轉 base64"""
+    """生成 K 線圖並轉 base64 (溫和壓縮版：節省流量但保留清晰度)"""
     buf = io.BytesIO()
+    
+    # 修復 3：設定縮小後的畫布與 DPI，保留 png 格式確保影線清晰
+    savefig_config = dict(fname=buf, dpi=100, format='png')
     mpf.plot(hist.tail(50), type='candle', style='charles',
-             volume=True, savefig=buf, figsize=(10,5))
+             volume=True, figsize=(8,4), savefig=savefig_config)
+             
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
 
@@ -67,13 +75,20 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     return json.loads(resp.choices[0].message.content)
 
 def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖，尋找騙線信號"""
+    """Gemini 視覺看圖，尋找騙線信號 (使用最新 SDK)"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
-    resp = gemini_model.generate_content([
-        prompt,
-        {"inline_data": {"mime_type":"image/png", "data": img_b64}}
-    ])
+              
+    # 修復 4：將 Base64 轉回 bytes 交給新版 SDK 處理
+    image_bytes = base64.b64decode(img_b64)
+    
+    resp = gemini_client.models.generate_content(
+        model='gemini-1.5-flash',
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+        ]
+    )
     return resp.text
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
@@ -144,7 +159,7 @@ def main():
 
             # 2. Gemini 視覺（若有）
             gemini_vision = None
-            if gemini_model:
+            if gemini_client:  # 變量名稱更新為 gemini_client
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
                     gemini_vision = gemini_vision_analysis(img_b64, symbol)
