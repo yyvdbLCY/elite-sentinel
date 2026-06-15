@@ -200,24 +200,26 @@ def hf_vision_analysis(img_b64, symbol):
     return None
 
 def call_vision_with_full_fallback(img_b64, symbol):
-    """视觉分析完整回退链：Gemini → Hugging Face → 降级为纯文字"""
-    # 先尝试 Gemini 系列
-    result = call_gemini_with_fallback(img_b64, symbol)
-    if result:
-        return result
+    # 优先使用 Gemini（如果已配置）
+    if gemini_client:
+        result = call_gemini_with_fallback(img_b64, symbol)
+        if result:
+            return result
+        print("Gemini 系列失败，尝试 Hugging Face 备选引擎...")
+    else:
+        print("Gemini 未配置，直接尝试 Hugging Face 视觉引擎...")
 
-    # Gemini 完全失败，尝试 Hugging Face 免费模型
+    # 次选 Hugging Face
     if HF_TOKEN:
-        print("Gemini 视觉失败，尝试 Hugging Face 视觉模型...")
+        print("正在调用 Hugging Face 视觉模型...")
         result = hf_vision_analysis(img_b64, symbol)
         if result:
             print("Hugging Face 视觉分析成功")
             return result
         else:
-            print("Hugging Face 视觉分析也失败")
+            print("Hugging Face 视觉分析失败")
     else:
-        print("未配置 Hugging Face Token，跳过备选视觉引擎")
-
+        print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
@@ -279,17 +281,21 @@ def main():
             hist, vol_ratio = get_recent_data(symbol)
             if hist is None:
                 continue
+
+            # 1. DeepSeek 初判
             initial = deepseek_judge_alert(symbol, hist, vol_ratio)
             if not initial.get("alert"):
                 continue
 
+            # 2. Gemini / Hugging Face 视觉分析
             confidence = initial.get("confidence", 50)
             gemini_vision = None
-            if False and confidence >= 70:
+
+            # 只要有任意视觉引擎可用，且置信度足够，就触发
+            if (gemini_client or HF_TOKEN) and confidence >= 70:
                 if not should_skip_gemini(symbol, hist):
                     try:
                         img_b64 = generate_chart_b64(symbol, hist)
-                        # 使用完整回退链
                         gemini_vision = call_vision_with_full_fallback(img_b64, symbol)
                         if gemini_vision:
                             LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
@@ -298,10 +304,14 @@ def main():
                 else:
                     print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
 
+            # 3. 最终决策
             final = deepseek_debate(symbol, initial, gemini_vision)
+
+            # 4. 新闻情绪
             news = search_news(symbol)
             sentiment = deepseek_sentiment(symbol, news)
 
+            # 5. 组装结构化推送
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             message = f"""
 🚨 *【{symbol}】异动预警* | 置信度：{final['confidence']}%
@@ -319,7 +329,8 @@ def main():
 {action_emoji} *建议*：{final.get('suggestion','')}
 """
             send_telegram(message.strip())
-            time.sleep(1)
+            time.sleep(1)  # 礼貌间隔
+
         except Exception as e:
             print(f"处理 {symbol} 时发生错误: {e}")
 
