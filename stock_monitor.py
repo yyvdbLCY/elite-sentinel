@@ -17,12 +17,15 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 # 初始化 AI 客戶端
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
-# 修復 2：更新為最新的 google-genai SDK 寫法
+# 使用最新的 google-genai SDK
 gemini_client = None
 if GEMINI_KEY:
     from google import genai
     from google.genai import types
     gemini_client = genai.Client(api_key=GEMINI_KEY)
+
+# Gemini 分析記錄：用於避免短時間內重複分析同一股票
+LAST_GEMINI_ANALYSIS = {}   # {symbol: (timestamp, close_price)}
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -42,16 +45,29 @@ def get_recent_data(symbol):
     return hist, vol_ratio
 
 def generate_chart_b64(symbol, hist):
-    """生成 K 線圖並轉 base64 (溫和壓縮版：節省流量但保留清晰度)"""
+    """生成 K 線圖並轉 base64 (進一步壓縮：降低 DPI、去除白邊，保留 PNG 清𥇦度)"""
     buf = io.BytesIO()
     
-    # 修復 3：設定縮小後的畫布與 DPI，保留 png 格式確保影線清晰
-    savefig_config = dict(fname=buf, dpi=100, format='png')
+    # 壓縮優化：dpi 降至 80，加入 bbox_inches 裁切白邊，節省體積
+    savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
     mpf.plot(hist.tail(50), type='candle', style='charles',
              volume=True, figsize=(8,4), savefig=savefig_config)
              
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
+
+def should_skip_gemini(symbol, hist):
+    """檢查是否應該跳過 Gemini：若 30 分鐘內同一股票已分析且價格波動 < 1%，則跳過"""
+    if symbol not in LAST_GEMINI_ANALYSIS:
+        return False
+    last_time, last_price = LAST_GEMINI_ANALYSIS[symbol]
+    current_price = hist['Close'].iloc[-1]
+    # 30 分鐘 = 1800 秒
+    if time.time() - last_time < 1800:
+        if abs(current_price - last_price) / last_price < 0.01:
+            print(f"{symbol} 近期已分析且波動小，跳過 Gemini")
+            return True
+    return False
 
 def deepseek_judge_alert(symbol, hist, vol_ratio):
     """DeepSeek 初始判斷：是否異動 + 支撐壓力 + 置信度 + 風險"""
@@ -80,7 +96,6 @@ def gemini_vision_analysis(img_b64, symbol):
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
               
-    # 修復 4：將 Base64 轉回 bytes 交給新版 SDK 處理
     image_bytes = base64.b64decode(img_b64)
     
     resp = gemini_client.models.generate_content(
@@ -95,7 +110,6 @@ def gemini_vision_analysis(img_b64, symbol):
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """最終決策：優先參考 Gemini 視覺，若無則由 DeepSeek 獨立給出具體建議"""
     
-    # 動態調整提示詞：有視覺就辯論，沒視覺就單獨總結
     if gemini_vision:
         expert_input = f"另一位專家（Gemini 視覺）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
     else:
@@ -163,16 +177,23 @@ def main():
             if not initial.get("alert"):
                 continue
 
-            # 2. Gemini 視覺（若有）
+            # 2. Gemini 視覺（加入觸發閾值 & 重複分析過濾）
+            confidence = initial.get("confidence", 50)
             gemini_vision = None
-            if gemini_client:
-                try:
-                    img_b64 = generate_chart_b64(symbol, hist)
-                    gemini_vision = gemini_vision_analysis(img_b64, symbol)
-                except Exception as e:
-                    print(f"Gemini 視覺失敗: {e}")
+            if gemini_client and confidence >= 70:
+                # 避免短時間內重複分析
+                if not should_skip_gemini(symbol, hist):
+                    try:
+                        img_b64 = generate_chart_b64(symbol, hist)
+                        gemini_vision = gemini_vision_analysis(img_b64, symbol)
+                        # 記錄本次分析時間與價格
+                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                    except Exception as e:
+                        print(f"Gemini 視覺失敗: {e}")
+                else:
+                    print(f"跳過 {symbol} 的 Gemini 分析 (近期已分析且波動小)")
             
-            # 3. 最終決策（注意：這行必須與上方的 'if gemini_client:' 對齊）
+            # 3. 最終決策
             final = deepseek_debate(symbol, initial, gemini_vision)
 
             # 4. 新聞情緒
