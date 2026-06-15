@@ -13,29 +13,64 @@ def load_stock_list(filepath="stocks.txt"):
 
 STOCKS = load_stock_list()
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # 初始化 DeepSeek
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
-# ==================== Gemini 穩定初始化 ====================
-gemini_model = None
-if GEMINI_KEY:
-    print("偵測到 Gemini API Key，開始初始化...")
-    try:
+# ==================== Gemini 多 Key 輪詢模組 ====================
+def load_gemini_keys():
+    keys_str = os.environ.get("GEMINI_API_KEYS", "")
+    if not keys_str:
+        return []
+    return [k.strip() for k in keys_str.split(",") if k.strip()]
+
+class GeminiRotator:
+    def __init__(self, keys, model_name='gemini-2.0-flash'):
+        if not keys:
+            raise ValueError("至少需要一個 Gemini API Key")
+        self.keys = keys
+        self.idx = 0
         import google.generativeai as genai
-        genai.configure(api_key=GEMINI_KEY)
-        
-        # 直接指定最新主流的免費多模態模型，不再透過 'vision' 關鍵字盲目篩選
-        model_name = 'gemini-2.0-flash'
-        gemini_model = genai.GenerativeModel(model_name)
-        print(f"✅ Gemini 視覺模組已啟動，使用模型：{model_name}")
+        self.genai = genai
+        self.model = self.genai.GenerativeModel(model_name)
+        print(f"✅ Gemini 多 Key 輪詢已啟動，共 {len(keys)} 組 Key，模型：{model_name}")
+
+    def generate_with_retry(self, prompt, img_b64, max_retries=None):
+        if max_retries is None:
+            max_retries = len(self.keys) * 2
+        for attempt in range(max_retries):
+            key = self.keys[self.idx]
+            self.genai.configure(api_key=key)
+            try:
+                response = self.model.generate_content([
+                    prompt,
+                    {"inline_data": {"mime_type":"image/jpeg", "data": img_b64}}
+                ])
+                return response.text
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    print(f"Gemini Key {key[:8]}... 達上限 (429)，切換下一個。")
+                    self.idx = (self.idx + 1) % len(self.keys)
+                    wait = 10 + (attempt * 5)
+                    print(f"等待 {wait} 秒後重試...")
+                    time.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError("所有 Gemini Key 都已達上限，請稍後再試。")
+
+gemini_rotator = None
+gemini_keys = load_gemini_keys()
+if gemini_keys:
+    print("偵測到 Gemini API Keys，開始初始化多 Key 輪詢...")
+    try:
+        gemini_rotator = GeminiRotator(gemini_keys)
     except Exception as e:
-        print(f"❌ Gemini 配置失敗：{e}")
+        print(f"❌ Gemini 多 Key 輪詢配置失敗：{e}")
 else:
-    print("未設定 GEMINI_API_KEY，跳過視覺模組")
+    print("未設定 GEMINI_API_KEYS，跳過視覺模組")
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -45,7 +80,6 @@ def get_recent_data(symbol):
     if hist.empty:
         return None, None
 
-    # 成交量異常檢測：最後一小時 vs 過去20小時均值
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
@@ -68,7 +102,7 @@ def generate_chart_b64(symbol, hist):
     buf = io.BytesIO()
     mpf.plot(hist.tail(50), type='candle', style='charles',
              volume=True,
-             savefig=dict(fname=buf, format='jpg', dpi=65, bbox_inches='tight'), # 改為 65
+             savefig=dict(fname=buf, format='jpg', dpi=65, bbox_inches='tight'),
              figsize=(10,5))
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
@@ -97,25 +131,18 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     return json.loads(resp.choices[0].message.content)
 
 def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖，尋找騙線信號"""
+    """Gemini 視覺看圖（透過多 Key 輪詢）"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
-    resp = gemini_model.generate_content([
-        prompt,
-        {"inline_data": {"mime_type":"image/jpeg", "data": img_b64}}
-    ])
-    return resp.text
+    return gemini_rotator.generate_with_retry(prompt, img_b64)
 
 def call_gemini_with_retry(img_b64, symbol, max_retries=2):
-    """帶重試與降級的 Gemini 調用"""
-    for attempt in range(max_retries):
-        try:
-            return gemini_vision_analysis(img_b64, symbol)
-        except Exception as e:
-            print(f"Gemini 視覺嘗試 {attempt+1}/{max_retries} 失敗：{e}")
-            if attempt < max_retries - 1:
-                time.sleep(2 * (attempt + 1))  # 指數退避
-    return None
+    """保留相容介面，實際由 GeminiRotator 處理重試與切換"""
+    try:
+        return gemini_vision_analysis(img_b64, symbol)
+    except Exception as e:
+        print(f"Gemini 視覺分析最終失敗：{e}")
+        return None
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """雙模型辯論：DeepSeek 參考 Gemini 視覺後修正結論"""
@@ -187,8 +214,8 @@ def main():
 
             confidence = initial.get("confidence", 50)
             
-# 只有當 DeepSeek 的置信度大於等於 70% 時，才讓 Gemini 幫忙雙重確認
-            use_gemini = (gemini_model is not None and confidence >= 70)
+            # 只有當 DeepSeek 的置信度大於等於 70% 且 Gemini 輪詢器可用時，才進行視覺分析
+            use_gemini = (gemini_rotator is not None and confidence >= 70)
             gemini_vision = None
             if use_gemini:
                 # 強制間隔 4 秒，防止連續請求觸發限流
