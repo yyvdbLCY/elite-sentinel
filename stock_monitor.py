@@ -26,6 +26,7 @@ if GEMINI_KEY:
 
 # Gemini 分析記錄：用於避免短時間內重複分析同一股票
 LAST_GEMINI_ANALYSIS = {}   # {symbol: (timestamp, close_price)}
+LAST_GEMINI_CALL_TIME = 0   # 控制請求間隔的時間戳
 
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
@@ -45,7 +46,7 @@ def get_recent_data(symbol):
     return hist, vol_ratio
 
 def generate_chart_b64(symbol, hist):
-    """生成 K 線圖並轉 base64 (進一步壓縮：降低 DPI、去除白邊，保留 PNG 清𥇦度)"""
+    """生成 K 線圖並轉 base64 (進一步壓縮：降低 DPI、去除白邊，保留 PNG 清晰度)"""
     buf = io.BytesIO()
     
     # 壓縮優化：dpi 降至 80，加入 bbox_inches 裁切白邊，節省體積
@@ -91,21 +92,56 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     )
     return json.loads(resp.choices[0].message.content)
 
-def gemini_vision_analysis(img_b64, symbol):
-    """Gemini 視覺看圖，尋找騙線信號 (使用最新 SDK)"""
+def gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash'):
+    """Gemini 視覺看圖，尋找騙線信號 (使用最新 SDK，支援指定模型)"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
               
     image_bytes = base64.b64decode(img_b64)
     
     resp = gemini_client.models.generate_content(
-        model='gemini-2.5-flash',
+        model=model,
         contents=[
             prompt,
             types.Part.from_bytes(data=image_bytes, mime_type="image/png")
         ]
     )
     return resp.text
+
+def call_gemini_with_fallback(img_b64, symbol):
+    """
+    帶間隔控制和模型回退的 Gemini 視覺調用。
+    優先 gemini-2.5-flash，若 503 則立即回退到 gemini-2.0-flash。
+    失敗返回 None。
+    """
+    global LAST_GEMINI_CALL_TIME
+
+    # 強制請求間隔：距上次調用至少 2 秒
+    now = time.time()
+    if now - LAST_GEMINI_CALL_TIME < 2:
+        sleep_time = 2 - (now - LAST_GEMINI_CALL_TIME)
+        time.sleep(sleep_time)
+
+    # 嘗試主模型
+    try:
+        result = gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash')
+        LAST_GEMINI_CALL_TIME = time.time()
+        return result
+    except Exception as e:
+        err_str = str(e)
+        if '503' in err_str or 'UNAVAILABLE' in err_str:
+            print(f"gemini-2.5-flash 不可用 (503)，嘗試回退到 gemini-2.0-flash...")
+            try:
+                result = gemini_vision_analysis(img_b64, symbol, model='gemini-2.0-flash')
+                LAST_GEMINI_CALL_TIME = time.time()
+                print("gemini-2.0-flash 回退成功")
+                return result
+            except Exception as e2:
+                print(f"gemini-2.0-flash 也失敗：{e2}")
+                return None
+        else:
+            print(f"Gemini 視覺調用失敗：{e}")
+            return None
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """最終決策：優先參考 Gemini 視覺，若無則由 DeepSeek 獨立給出具體建議"""
@@ -185,11 +221,13 @@ def main():
                 if not should_skip_gemini(symbol, hist):
                     try:
                         img_b64 = generate_chart_b64(symbol, hist)
-                        gemini_vision = gemini_vision_analysis(img_b64, symbol)
-                        # 記錄本次分析時間與價格
-                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                        # 使用帶間隔控制和模型回退的調用
+                        gemini_vision = call_gemini_with_fallback(img_b64, symbol)
+                        if gemini_vision:
+                            # 記錄本次分析時間與價格
+                            LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
                     except Exception as e:
-                        print(f"Gemini 視覺失敗: {e}")
+                        print(f"Gemini 圖形生成或分析失敗: {e}")
                 else:
                     print(f"跳過 {symbol} 的 Gemini 分析 (近期已分析且波動小)")
             
