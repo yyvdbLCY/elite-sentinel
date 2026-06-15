@@ -2,8 +2,12 @@ name: 精銳哨兵監控
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # 每5分鐘運行一次（UTC）
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: elite-sentinel
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -20,7 +24,7 @@ jobs:
       - name: Execute Elite Sentinel
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python stock_monitor.py
