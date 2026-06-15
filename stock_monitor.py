@@ -75,18 +75,39 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-def deepseek_judge_alert(symbol, hist, vol_ratio):
+# ---------- 强化版 DeepSeek 初判（硬指标过滤 + 趋势摘要）----------
+def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
-    prompt = f"""你是顶级交易员。以下是 {symbol} 近 24 小时数据：
+
+    # 根据是否强制指令构建不同的规则头部
+    if force:
+        hard_filter_block = "(用户主动请求分析，忽略自动静默阈值，但若以下硬指标未通过，请在 risk_factors 中注明，仍给出正常分析)"
+    else:
+        hard_filter_block = """## 硬性过滤规则（静默阈值）
+请先执行以下检查，若触发则直接返回 alert: false，除非发现明确的反转形态（头肩底、双底、楔形突破、早晨之星、镊底等）可将其覆盖：
+1. 成交量倍数 < 2.0，且未出现上述底部形态 → alert: false, confidence: 0, reason: "量能不足且无底部反转形态"
+2. 价格未突破过去20小时最高价，且未出现破位下跌 → alert: false, confidence: 10, reason: "价格未突破前高，无突破信号"
+"""
+
+    prompt = f"""你是顶级交易员，严格遵循下述规则进行分析。
+
+{hard_filter_block}
+
+## 趋势摘要
+用一句话总结过去24小时的价格运行轨迹及当前位置，例如："连续缩量阴跌后回踩20周期均线不破，最后一小时出现放量反弹"。
+
+## 分析任务（仅当硬规则未触发或已覆盖时执行）
+- 判断是否出现放量突破、断崖下跌、关键反转等非正常逻辑异动
+- 推算关键支撑位和压力位
+- 输出置信度（0-100%），并提供3个可能误导判断的风险因素
+- 当置信度 ≥ 80 时，你必须在 reason 中列举至少3个相互印证的看多/看空信号
+
+以下是 {symbol} 近 24 小时数据：
 {data_text}
 当前成交量是过去 20 小时均值的 {vol_ratio:.1f} 倍。
 
-判断是否出现需要提醒的异动（普通小波动忽略）。仅当出现放量突破、断崖下跌、关键反转等非正常逻辑时，才标记 alert: true。
-推算关键支撑位和压力位。
-输出你的判断置信度（0-100%），并列出可能让你误判的 3 个风险因素。
-
 严格输出 JSON：
-{{"alert": true/false, "reason":"...", "support": 支撑价, "resistance": 压力价, "confidence": 85, "risk_factors": ["风险1","风险2","风险3"]}}"""
+{{"alert": true/false, "reason":"...", "support": 支撑价, "resistance": 压力价, "confidence": 0-100, "risk_factors": ["风险1","风险2","风险3"], "trend_summary": "趋势摘要"}}"""
 
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -96,9 +117,13 @@ def deepseek_judge_alert(symbol, hist, vol_ratio):
     )
     return json.loads(resp.choices[0].message.content)
 
-def gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash'):
-    prompt = ("请像人类专家一样分析这张 K 线图，观察形态、均线、MACD，"
-              "特别注意是否存在假突破、背离或骗线信号，给出简洁结论。")
+# ---------- 强化版 Gemini 视觉分析（注入背景趋势）----------
+def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
+    base_prompt = "作为首席宏观分析师，严格审视以下视觉信息。"
+    if trend_summary:
+        base_prompt += f"\n【背景趋势】{trend_summary}"
+    prompt = base_prompt + "\n请结合上述趋势背景分析这张 K 线图，重点回答：\n1. 当前形态（如头肩、双底、旗形整理等）及所处阶段。\n2. 是否存在假突破、背离或骗线信号？需与背景趋势交叉验证。\n3. 量价关系是否健康？给出简洁结论。"
+    
     image_bytes = base64.b64decode(img_b64)
     resp = gemini_client.models.generate_content(
         model=model,
@@ -114,7 +139,6 @@ def can_call_gemini():
     if GEMINI_RUN_CALLS >= GEMINI_PER_RUN_LIMIT:
         print(f"本次工作流已调用视觉 {GEMINI_PER_RUN_LIMIT} 次，跳过后续调用")
         return False
-    # 每分钟限制已移除，由免费层自身限流 + 备选引擎兜底
     return True
 
 def record_gemini_call():
@@ -122,7 +146,8 @@ def record_gemini_call():
     GEMINI_CALL_LOG.append(time.time())
     GEMINI_RUN_CALLS += 1
 
-def call_gemini_with_fallback(img_b64, symbol):
+# ---------- 强化版 Gemini 回退（传递趋势摘要）----------
+def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
     global LAST_GEMINI_CALL_TIME
     if not can_call_gemini():
         return None
@@ -130,7 +155,7 @@ def call_gemini_with_fallback(img_b64, symbol):
     if now - LAST_GEMINI_CALL_TIME < 2:
         time.sleep(2 - (now - LAST_GEMINI_CALL_TIME))
     try:
-        result = gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash')
+        result = gemini_vision_analysis(img_b64, symbol, trend_summary, model='gemini-2.5-flash')
         LAST_GEMINI_CALL_TIME = time.time()
         record_gemini_call()
         return result
@@ -139,7 +164,7 @@ def call_gemini_with_fallback(img_b64, symbol):
         if '503' in err_str or 'UNAVAILABLE' in err_str:
             print(f"gemini-2.5-flash 不可用 (503)，回退到 gemini-2.0-flash...")
             try:
-                result = gemini_vision_analysis(img_b64, symbol, model='gemini-2.0-flash')
+                result = gemini_vision_analysis(img_b64, symbol, trend_summary, model='gemini-2.0-flash')
                 LAST_GEMINI_CALL_TIME = time.time()
                 record_gemini_call()
                 print("gemini-2.0-flash 回退成功")
@@ -161,12 +186,7 @@ def hf_vision_analysis(img_b64, symbol):
         "parameters": {"max_new_tokens": 200, "temperature": 0.1}
     }
     try:
-        # 使用 base64 直接作为二进制数据发送（部分模型接受 image_url，这里用 image 字段）
-        # Qwen2-VL 接受多模态输入格式，Hugging Face 推理 API 需要以文档规定的格式发送
-        # 通用做法：将 base64 转换为 data URI，放入 inputs 中作为图像标记
         image_data = f"data:image/png;base64,{img_b64}"
-        # 对于指令类模型，prompt 格式需要包含特殊 token，但 HF 推理 API 会根据模型自动处理
-        # 简单起见，我们构造一个标准对话格式
         messages = [
             {
                 "role": "user",
@@ -176,7 +196,6 @@ def hf_vision_analysis(img_b64, symbol):
                 ]
             }
         ]
-        # 有些端点接受 conversations 格式，这里为了兼容，使用通用方法
         resp = requests.post(
             HF_API_URL,
             headers=headers,
@@ -184,11 +203,10 @@ def hf_vision_analysis(img_b64, symbol):
                 "inputs": messages,
                 "parameters": payload["parameters"]
             },
-            timeout=20  # Hugging Face 免费层可能较慢
+            timeout=20
         )
         if resp.status_code == 200:
             result = resp.json()
-            # Qwen2-VL 的输出通常在 generated_text 中
             if isinstance(result, list) and len(result) > 0:
                 return result[0].get("generated_text", "")
             elif isinstance(result, dict):
@@ -199,17 +217,16 @@ def hf_vision_analysis(img_b64, symbol):
         print(f"Hugging Face 调用异常: {e}")
     return None
 
-def call_vision_with_full_fallback(img_b64, symbol):
-    # 优先使用 Gemini（如果已配置）
+# ---------- 强化版完整回退链（传递趋势摘要）----------
+def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
     if gemini_client:
-        result = call_gemini_with_fallback(img_b64, symbol)
+        result = call_gemini_with_fallback(img_b64, symbol, trend_summary)
         if result:
             return result
         print("Gemini 系列失败，尝试 Hugging Face 备选引擎...")
     else:
         print("Gemini 未配置，直接尝试 Hugging Face 视觉引擎...")
 
-    # 次选 Hugging Face
     if HF_TOKEN:
         print("正在调用 Hugging Face 视觉模型...")
         result = hf_vision_analysis(img_b64, symbol)
@@ -282,21 +299,22 @@ def main():
             if hist is None:
                 continue
 
-            # 1. DeepSeek 初判
+            # 1. DeepSeek 初判（使用强化版 Prompt，force=False 默认启用硬指标过滤）
             initial = deepseek_judge_alert(symbol, hist, vol_ratio)
             if not initial.get("alert"):
                 continue
 
-            # 2. Gemini / Hugging Face 视觉分析
+            # 2. 视觉分析（注入趋势摘要）
             confidence = initial.get("confidence", 50)
             gemini_vision = None
 
-            # 只要有任意视觉引擎可用，且置信度足够，就触发
             if (gemini_client or HF_TOKEN) and confidence >= 70:
                 if not should_skip_gemini(symbol, hist):
                     try:
                         img_b64 = generate_chart_b64(symbol, hist)
-                        gemini_vision = call_vision_with_full_fallback(img_b64, symbol)
+                        # 从初判结果中提取趋势摘要
+                        trend_desc = initial.get("trend_summary", "")
+                        gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
                         if gemini_vision:
                             LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
                     except Exception as e:
@@ -311,10 +329,18 @@ def main():
             news = search_news(symbol)
             sentiment = deepseek_sentiment(symbol, news)
 
-            # 5. 组装结构化推送
+            # 5. 组装结构化推送（新增动态置信度标签）
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+            conf_val = final.get("confidence", 50)
+            if conf_val >= 80:
+                conf_tag = "🟢高置信度"
+            elif conf_val >= 50:
+                conf_tag = "🟡中置信度"
+            else:
+                conf_tag = "🔴低置信度"
+
             message = f"""
-🚨 *【{symbol}】异动预警* | 置信度：{final['confidence']}%
+🚨 *【{symbol}】异动预警* | 置信度：{conf_val}% {conf_tag}
 
 📊 *信号拆解*
   ▪ 价格行为：{final['signal_breakdown'].get('price_action','')}
@@ -329,7 +355,7 @@ def main():
 {action_emoji} *建议*：{final.get('suggestion','')}
 """
             send_telegram(message.strip())
-            time.sleep(1)  # 礼貌间隔
+            time.sleep(1)
 
         except Exception as e:
             print(f"处理 {symbol} 时发生错误: {e}")
