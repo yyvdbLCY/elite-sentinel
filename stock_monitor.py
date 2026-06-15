@@ -28,6 +28,12 @@ if GEMINI_KEY:
 LAST_GEMINI_ANALYSIS = {}   # {symbol: (timestamp, close_price)}
 LAST_GEMINI_CALL_TIME = 0   # 控制請求間隔的時間戳
 
+# Gemini 配額保護：硬性呼叫上限
+GEMINI_CALL_LOG = []          # 滑動窗口時間戳列表（每分鐘）
+GEMINI_RPM_LIMIT = 8          # 每分鐘最多調用次數（保留安全邊界）
+GEMINI_PER_RUN_LIMIT = 3      # 每次工作流最多調用次數
+GEMINI_RUN_CALLS = 0          # 本次工作流已調用次數
+
 # ==================== 工具函數 ====================
 def get_recent_data(symbol):
     """拉取近5天小時線，並計算成交量異常倍數"""
@@ -48,12 +54,9 @@ def get_recent_data(symbol):
 def generate_chart_b64(symbol, hist):
     """生成 K 線圖並轉 base64 (進一步壓縮：降低 DPI、去除白邊，保留 PNG 清晰度)"""
     buf = io.BytesIO()
-    
-    # 壓縮優化：dpi 降至 80，加入 bbox_inches 裁切白邊，節省體積
     savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
     mpf.plot(hist.tail(50), type='candle', style='charles',
              volume=True, figsize=(8,4), savefig=savefig_config)
-             
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
 
@@ -63,7 +66,6 @@ def should_skip_gemini(symbol, hist):
         return False
     last_time, last_price = LAST_GEMINI_ANALYSIS[symbol]
     current_price = hist['Close'].iloc[-1]
-    # 30 分鐘 = 1800 秒
     if time.time() - last_time < 1800:
         if abs(current_price - last_price) / last_price < 0.01:
             print(f"{symbol} 近期已分析且波動小，跳過 Gemini")
@@ -96,9 +98,7 @@ def gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash'):
     """Gemini 視覺看圖，尋找騙線信號 (使用最新 SDK，支援指定模型)"""
     prompt = ("請像人類專家一樣分析這張 K 線圖，觀察形態、均線、MACD，"
               "特別注意是否存在假突破、背離或騙線信號，給出簡潔結論。")
-              
     image_bytes = base64.b64decode(img_b64)
-    
     resp = gemini_client.models.generate_content(
         model=model,
         contents=[
@@ -108,13 +108,42 @@ def gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash'):
     )
     return resp.text
 
+def can_call_gemini():
+    """檢查是否超過每分鐘或每次工作流調用上限"""
+    global GEMINI_CALL_LOG, GEMINI_RUN_CALLS
+
+    # 檢查每次工作流上限
+    if GEMINI_RUN_CALLS >= GEMINI_PER_RUN_LIMIT:
+        print(f"本次工作流已調用 Gemini {GEMINI_PER_RUN_LIMIT} 次，跳過後續調用")
+        return False
+
+    # 清理滑動窗口外的時間戳
+    now = time.time()
+    GEMINI_CALL_LOG = [t for t in GEMINI_CALL_LOG if now - t < 60]
+
+    if len(GEMINI_CALL_LOG) >= GEMINI_RPM_LIMIT:
+        print(f"每分鐘 Gemini 調用已達上限 ({GEMINI_RPM_LIMIT} 次)，跳過本次調用")
+        return False
+
+    return True
+
+def record_gemini_call():
+    """記錄一次 Gemini 調用"""
+    global GEMINI_CALL_LOG, GEMINI_RUN_CALLS
+    GEMINI_CALL_LOG.append(time.time())
+    GEMINI_RUN_CALLS += 1
+
 def call_gemini_with_fallback(img_b64, symbol):
     """
-    帶間隔控制和模型回退的 Gemini 視覺調用。
+    帶間隔控制和模型回退的 Gemini 視覺調用（已整合配額保護）。
     優先 gemini-2.5-flash，若 503 則立即回退到 gemini-2.0-flash。
-    失敗返回 None。
+    失敗或超限則返回 None。
     """
     global LAST_GEMINI_CALL_TIME
+
+    # 配額保護：超過每分鐘或每次工作流上限則直接跳過
+    if not can_call_gemini():
+        return None
 
     # 強制請求間隔：距上次調用至少 2 秒
     now = time.time()
@@ -126,6 +155,7 @@ def call_gemini_with_fallback(img_b64, symbol):
     try:
         result = gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash')
         LAST_GEMINI_CALL_TIME = time.time()
+        record_gemini_call()
         return result
     except Exception as e:
         err_str = str(e)
@@ -134,6 +164,7 @@ def call_gemini_with_fallback(img_b64, symbol):
             try:
                 result = gemini_vision_analysis(img_b64, symbol, model='gemini-2.0-flash')
                 LAST_GEMINI_CALL_TIME = time.time()
+                record_gemini_call()
                 print("gemini-2.0-flash 回退成功")
                 return result
             except Exception as e2:
@@ -145,7 +176,6 @@ def call_gemini_with_fallback(img_b64, symbol):
 
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     """最終決策：優先參考 Gemini 視覺，若無則由 DeepSeek 獨立給出具體建議"""
-    
     if gemini_vision:
         expert_input = f"另一位專家（Gemini 視覺）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
     else:
@@ -213,18 +243,15 @@ def main():
             if not initial.get("alert"):
                 continue
 
-            # 2. Gemini 視覺（加入觸發閾值 & 重複分析過濾）
+            # 2. Gemini 視覺（加入觸發閾值 & 重複分析過濾 & 配額保護）
             confidence = initial.get("confidence", 50)
             gemini_vision = None
             if gemini_client and confidence >= 70:
-                # 避免短時間內重複分析
                 if not should_skip_gemini(symbol, hist):
                     try:
                         img_b64 = generate_chart_b64(symbol, hist)
-                        # 使用帶間隔控制和模型回退的調用
                         gemini_vision = call_gemini_with_fallback(img_b64, symbol)
                         if gemini_vision:
-                            # 記錄本次分析時間與價格
                             LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
                     except Exception as e:
                         print(f"Gemini 圖形生成或分析失敗: {e}")
