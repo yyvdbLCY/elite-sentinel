@@ -165,13 +165,14 @@ def main():
 
             # 2. Gemini 視覺（若有）
             gemini_vision = None
-            if gemini_client:  # 變量名稱更新為 gemini_client
+            if gemini_client:
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
                     gemini_vision = gemini_vision_analysis(img_b64, symbol)
                 except Exception as e:
-                    
-# 3. 最終決策（將視覺結果傳給 DeepSeek，若無則傳 None 讓其根據量價自行判斷）
+                    print(f"Gemini 視覺失敗: {e}")
+            
+            # 3. 最終決策（注意：這行必須與上方的 'if gemini_client:' 對齊）
             final = deepseek_debate(symbol, initial, gemini_vision)
 
             # 4. 新聞情緒
