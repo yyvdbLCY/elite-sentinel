@@ -5,8 +5,9 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-# 修復 1：過濾掉空字串並去除多餘空格，避免 "Empty ticker name" 錯誤
-STOCKS = [s.strip() for s in os.environ.get("STOCK_LIST", "").split(",") if s.strip()]
+# 從倉庫根目錄的 stocks.txt 讀取股票清單 (每行一個代碼，支援 # 註解)
+with open("stocks.txt", "r", encoding="utf-8") as f:
+    STOCKS = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")         # 可選
