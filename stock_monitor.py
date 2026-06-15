@@ -110,15 +110,11 @@ def gemini_vision_analysis(img_b64, symbol, model='gemini-2.5-flash'):
     return resp.text
 
 def can_call_gemini():
-    global GEMINI_CALL_LOG, GEMINI_RUN_CALLS
+    global GEMINI_RUN_CALLS
     if GEMINI_RUN_CALLS >= GEMINI_PER_RUN_LIMIT:
         print(f"本次工作流已调用视觉 {GEMINI_PER_RUN_LIMIT} 次，跳过后续调用")
         return False
-    now = time.time()
-    GEMINI_CALL_LOG = [t for t in GEMINI_CALL_LOG if now - t < 60]
-    if len(GEMINI_CALL_LOG) >= GEMINI_RPM_LIMIT:
-        print(f"每分钟视觉调用已达上限 ({GEMINI_RPM_LIMIT} 次)，跳过本次调用")
-        return False
+    # 每分钟限制已移除，由免费层自身限流 + 备选引擎兜底
     return True
 
 def record_gemini_call():
