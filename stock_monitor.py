@@ -1,6 +1,8 @@
 import os, json, base64, io, requests, feedparser, time
 import yfinance as yf
 import mplfinance as mpf
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from openai import OpenAI
 from datetime import datetime, timedelta
 
@@ -59,16 +61,14 @@ def get_recent_data(symbol):
     except:
         pass
 
-    # 开盘第一小时量比（基于过去5个交易日同时段均值）
+    # 开盘第一小时量比
     open_hour_ratio = None
     try:
-        # 取最近一天的数据
         today = hist[hist.index.date == hist.index[-1].date()]
         if len(today) > 0:
             first_hour_vol = today['Volume'].iloc[0]
             past_5 = hist[hist.index.date < hist.index[-1].date()]
             if len(past_5) >= 5:
-                # 按日期分组取第一天第一小时
                 group_dates = sorted(set(past_5.index.date))[-5:]
                 vols = []
                 for d in group_dates:
@@ -109,11 +109,10 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- DeepSeek 初判（强化量能 + 硬指标 + 指令约束）----------
+# ---------- DeepSeek 初判 ----------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
 
-    # 构建额外数据文本
     extra_info = ""
     if turnover is not None:
         extra_info += f"\n当前换手率：{turnover:.2f}%"
@@ -167,7 +166,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     )
     return json.loads(resp.choices[0].message.content)
 
-# ---------- Gemini 视觉分析（不变）----------
+# ---------- Gemini 视觉分析 ----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作为首席宏观分析师，严格审视以下视觉信息。"
     if trend_summary:
@@ -264,7 +263,7 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
-# ---------- 最终辩论（新增交易计划要求）----------
+# ---------- 最终辩论 ----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位专家（视觉分析）看完 K 线图后指出：\n{gemini_vision}\n请结合视觉分析修正你的判断。"
@@ -339,15 +338,48 @@ def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
+# ---------- Google Sheets 自动记录 ----------
+def init_gsheet():
+    """初始化 Google Sheets 连接，返回 worksheet 对象"""
+    if 'GDRIVE_CREDENTIALS' not in os.environ:
+        print("未设置 GDRIVE_CREDENTIALS，跳过 Sheets 记录")
+        return None
+    try:
+        creds_dict = json.loads(os.environ['GDRIVE_CREDENTIALS'])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ])
+        client = gspread.authorize(creds)
+        sheet = client.open("精锐哨兵预警记录").sheet1
+        return sheet
+    except Exception as e:
+        print(f"Google Sheets 初始化失败: {e}")
+        return None
+
+def append_alert(sheet, symbol, confidence, suggestion, base_price):
+    """向 Google Sheets 追加一行预警记录"""
+    if sheet is None:
+        return
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = [timestamp, symbol, confidence, base_price, suggestion]
+        sheet.append_row(row)
+        print(f"已记录 {symbol} 预警到 Sheets")
+    except Exception as e:
+        print(f"写入 Sheets 失败: {e}")
+
 # ==================== 主流程 ====================
 def main():
+    # 初始化 Google Sheets（仅一次）
+    sheet = init_gsheet()
+
     for symbol in STOCKS:
         try:
             hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
             if hist is None:
                 continue
 
-            # 初判（传入量能细化数据）
             initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
             if not initial.get("alert"):
                 continue
@@ -373,7 +405,6 @@ def main():
             news = search_news(symbol)
             sentiment = deepseek_sentiment(symbol, news)
 
-            # 置信度标签
             conf_val = final.get("confidence", 50)
             if conf_val >= 80:
                 conf_tag = "🟢高置信度"
@@ -382,8 +413,8 @@ def main():
             else:
                 conf_tag = "🔴低置信度"
 
-            # 构建消息（包含追踪密钥）
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+            base_price = hist['Close'].iloc[-1]
             message = f"""
 🚨 *【{symbol}】异动预警* | 置信度：{conf_val}% {conf_tag}
 
@@ -399,13 +430,13 @@ def main():
 
 {action_emoji} *建议*：{final.get('suggestion','')}
 
-🔑 *追踪密钥*：`{symbol} | 观察中 | 基准价 {hist['Close'].iloc[-1]:.2f}`
+🔑 *追踪密钥*：`{symbol} | 观察中 | 基准价 {base_price:.2f}`
 """
-            send_telegram(message.strip())# 写入 Google Sheets（需要 credentials.json 或 GDRIVE_CREDENTIALS 环境变量）
-try:
-    append_alert(symbol, conf_val, final.get('suggestion',''), hist['Close'].iloc[-1])
-except Exception as e:
-    print(f"写入 Sheets 失败: {e}")
+            send_telegram(message.strip())
+
+            # 自动记录到 Google Sheets
+            append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
+
             time.sleep(1)
 
         except Exception as e:
