@@ -401,7 +401,11 @@ def main():
 
 🔑 *追踪密钥*：`{symbol} | 观察中 | 基准价 {hist['Close'].iloc[-1]:.2f}`
 """
-            send_telegram(message.strip())
+            send_telegram(message.strip())# 写入 Google Sheets（需要 credentials.json 或 GDRIVE_CREDENTIALS 环境变量）
+try:
+    append_alert(symbol, conf_val, final.get('suggestion',''), hist['Close'].iloc[-1])
+except Exception as e:
+    print(f"写入 Sheets 失败: {e}")
             time.sleep(1)
 
         except Exception as e:
