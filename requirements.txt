@@ -4,3 +4,5 @@ openai
 feedparser
 requests
 google-genai
+gspread
+oauth2client
