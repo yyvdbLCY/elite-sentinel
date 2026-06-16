@@ -10,44 +10,78 @@ with open("stocks.txt", "r", encoding="utf-8") as f:
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN")                   # Hugging Face 免费 Token
+HF_TOKEN = os.environ.get("HF_TOKEN")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
-# Gemini 客户端（最新 SDK）
+# Gemini 客户端
 gemini_client = None
 if GEMINI_KEY:
     from google import genai
     from google.genai import types
     gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-# Hugging Face 视觉模型配置
-HF_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"          # 中文优秀，完全免费
+# Hugging Face 视觉模型
+HF_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_VISION_MODEL}"
 
 # 状态记录
 LAST_GEMINI_ANALYSIS = {}
 LAST_GEMINI_CALL_TIME = 0
 GEMINI_CALL_LOG = []
-GEMINI_RPM_LIMIT = 8
 GEMINI_PER_RUN_LIMIT = 3
 GEMINI_RUN_CALLS = 0
 
 # ==================== 工具函数 ====================
 def get_recent_data(symbol):
+    """拉取数据，额外计算换手率和开盘第一小时量比"""
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
     if hist.empty:
-        return None, None
+        return None, None, None, None
+
+    # 成交量倍数
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
         vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
     else:
         vol_ratio = 1.0
-    return hist, vol_ratio
+
+    # 换手率
+    turnover = None
+    try:
+        shares = ticker.info.get('sharesOutstanding')
+        if shares and shares > 0:
+            turnover = (hist['Volume'].iloc[-1] / shares) * 100
+    except:
+        pass
+
+    # 开盘第一小时量比（基于过去5个交易日同时段均值）
+    open_hour_ratio = None
+    try:
+        # 取最近一天的数据
+        today = hist[hist.index.date == hist.index[-1].date()]
+        if len(today) > 0:
+            first_hour_vol = today['Volume'].iloc[0]
+            past_5 = hist[hist.index.date < hist.index[-1].date()]
+            if len(past_5) >= 5:
+                # 按日期分组取第一天第一小时
+                group_dates = sorted(set(past_5.index.date))[-5:]
+                vols = []
+                for d in group_dates:
+                    day_data = past_5[past_5.index.date == d]
+                    if len(day_data) > 0:
+                        vols.append(day_data['Volume'].iloc[0])
+                if vols:
+                    avg_first = sum(vols) / len(vols)
+                    open_hour_ratio = first_hour_vol / avg_first if avg_first > 0 else None
+    except:
+        pass
+
+    return hist, vol_ratio, turnover, open_hour_ratio
 
 def generate_chart_b64(symbol, hist):
     import warnings
@@ -75,18 +109,25 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- 融合指令约束 + 事实锚定的 DeepSeek 初判 ----------
-def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
+# ---------- DeepSeek 初判（强化量能 + 硬指标 + 指令约束）----------
+def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
+
+    # 构建额外数据文本
+    extra_info = ""
+    if turnover is not None:
+        extra_info += f"\n当前换手率：{turnover:.2f}%"
+    if open_hour_ratio is not None:
+        extra_info += f"\n开盘第一小时量比（相对过去5日同时段均值）：{open_hour_ratio:.2f}"
 
     if force:
         hard_filter_block = "(用户主动请求分析，忽略自动静默阈值，但若以下硬指标未通过，请在 risk_factors 中注明，仍给出正常分析)"
     else:
-        hard_filter_block = """## 硬性过滤规则（静默阈值）
+        hard_filter_block = f"""## 硬性过滤规则（静默阈值）
 请先执行以下检查，若触发则直接返回 alert: false，除非发现明确的反转形态（头肩底、双底、楔形突破、早晨之星、镊底等）可将其覆盖：
 1. 成交量倍数 < 2.0，且未出现上述底部形态 → alert: false, confidence: 0, reason: "量能不足且无底部反转形态"
 2. 价格未突破过去20小时最高价，且未出现破位下跌 → alert: false, confidence: 10, reason: "价格未突破前高，无突破信号"
-"""
+3. 若换手率 > 5% 且价格涨幅 < 1%（滞涨），必须在 reason 中注明“派发风险”，但仍可继续分析（alert 可为 true）"""
 
     prompt = f"""你是顶级交易员，严格遵循下述规则进行分析。
 
@@ -103,7 +144,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
 {hard_filter_block}
 
 ## 趋势摘要
-用一句话总结过去24小时的价格运行轨迹及当前位置，例如："连续缩量阴跌后回踩20周期均线不破，最后一小时出现放量反弹"。
+用一句话总结过去24小时的价格运行轨迹及当前位置。
 
 ## 分析任务（仅当硬规则未触发或已覆盖时执行）
 - 判断是否出现放量突破、断崖下跌、关键反转等非正常逻辑异动
@@ -113,7 +154,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
 
 以下是 {symbol} 近 24 小时数据：
 {data_text}
-当前成交量是过去 20 小时均值的 {vol_ratio:.1f} 倍。
+当前成交量是过去 20 小时均值的 {vol_ratio:.1f} 倍。{extra_info}
 
 严格输出 JSON：
 {{"alert": true/false, "reason":"...", "support": "支撑价 [来源]", "resistance": "压力价 [来源]", "confidence": 0-100, "risk_factors": ["风险1","风险2","风险3"], "trend_summary": "趋势摘要"}}"""
@@ -126,20 +167,16 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
     )
     return json.loads(resp.choices[0].message.content)
 
-# ---------- Gemini 视觉分析（保持不变）----------
+# ---------- Gemini 视觉分析（不变）----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作为首席宏观分析师，严格审视以下视觉信息。"
     if trend_summary:
         base_prompt += f"\n【背景趋势】{trend_summary}"
-    prompt = base_prompt + "\n请结合上述趋势背景分析这张 K 线图，重点回答：\n1. 当前形态（如头肩、双底、旗形整理等）及所处阶段。\n2. 是否存在假突破、背离或骗线信号？需与背景趋势交叉验证。\n3. 量价关系是否健康？给出简洁结论。"
-    
+    prompt = base_prompt + "\n请结合上述趋势背景分析这张 K 线图，重点回答：\n1. 当前形态及所处阶段。\n2. 是否存在假突破、背离或骗线信号？需与背景趋势交叉验证。\n3. 量价关系是否健康？给出简洁结论。"
     image_bytes = base64.b64decode(img_b64)
     resp = gemini_client.models.generate_content(
         model=model,
-        contents=[
-            prompt,
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-        ]
+        contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type="image/png")]
     )
     return resp.text
 
@@ -175,7 +212,6 @@ def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
                 result = gemini_vision_analysis(img_b64, symbol, trend_summary, model='gemini-2.0-flash')
                 LAST_GEMINI_CALL_TIME = time.time()
                 record_gemini_call()
-                print("gemini-2.0-flash 回退成功")
                 return result
             except Exception as e2:
                 print(f"gemini-2.0-flash 也失败: {e2}")
@@ -194,24 +230,8 @@ def hf_vision_analysis(img_b64, symbol):
     }
     try:
         image_data = f"data:image/png;base64,{img_b64}"
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image_data},
-                    {"type": "text", "text": payload["inputs"]}
-                ]
-            }
-        ]
-        resp = requests.post(
-            HF_API_URL,
-            headers=headers,
-            json={
-                "inputs": messages,
-                "parameters": payload["parameters"]
-            },
-            timeout=20
-        )
+        messages = [{"role": "user", "content": [{"type": "image", "image": image_data}, {"type": "text", "text": payload["inputs"]}]}]
+        resp = requests.post(HF_API_URL, headers=headers, json={"inputs": messages, "parameters": payload["parameters"]}, timeout=20)
         if resp.status_code == 200:
             result = resp.json()
             if isinstance(result, list) and len(result) > 0:
@@ -232,7 +252,6 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("Gemini 系列失败，尝试 Hugging Face 备选引擎...")
     else:
         print("Gemini 未配置，直接尝试 Hugging Face 视觉引擎...")
-
     if HF_TOKEN:
         print("正在调用 Hugging Face 视觉模型...")
         result = hf_vision_analysis(img_b64, symbol)
@@ -245,17 +264,17 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
-# ---------- 融合指令约束 + 事实锚定的最终辩论 ----------
+# ---------- 最终辩论（新增交易计划要求）----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位专家（视觉分析）看完 K 线图后指出：\n{gemini_vision}\n请结合视觉分析修正你的判断。"
     else:
-        expert_input = "系统暂无视觉分析数据。请仅基于上述量价数据（包含支撑压力与异动原因），独立给出最终的交易决策与具体建议。"
+        expert_input = "系统暂无视觉分析数据。请仅基于上述量价数据，独立给出最终的交易决策与具体建议。"
 
     debate_prompt = f"""你是顶级交易员，正在对一份初始分析进行最终裁决。
 
 ## 认知诚实原则（指令约束）
-- 你必须仅基于你之前看到的量价数据、当前提供的视觉分析结论以及已有的风险因素进行判断。
+- 你必须仅基于量价数据、视觉分析结论以及风险因素进行判断。
 - 如果某个操作建议缺乏直接的数据或图形支撑，必须在 suggestion 中注明“该建议基于综合经验，缺乏直接量化指标”。
 - 不得编造未在上下文中出现的支撑/压力位或趋势。
 
@@ -264,6 +283,15 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
 - "[基于纯量价分析]"
 - "[基于视觉分析对假突破的确认]"
 - "[基于新闻情绪与量价共振]"
+
+## 高级交易计划要求
+你必须输出一个完整的交易计划，包含以下要素：
+1. **盈亏比矩阵**：根据建议的入场、止损和目标位，自动计算风险回报比（盈亏比）。若盈亏比低于 1:3，必须在 suggestion 中额外标注“博弈性价比低”。
+2. **双重止损机制**：止损必须包含空间止损（价格跌破 X 元）和时间止损（若在 Y 元上方横盘超过 Z 个交易日无法拉回，则失效）。若无法判断时间，可假设“横盘 2 个交易日失效”。
+3. **逻辑树预判（A/B/C 路径）**：
+   - 路径 A（达标）：若价格站稳 X 元，应如何调仓或加仓。
+   - 路径 B（失效）：若价格跌破 Y 元或时间止损触发，该信号作废。
+   - 路径 C（横盘）：若在 Z 区间震荡，建议最多持有几天或需等待的突破方向。
 
 你之前对 {symbol} 的初步判断是：
 {json.dumps(initial_judge, ensure_ascii=False)}
@@ -280,7 +308,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     "visual_pattern": "若无视觉分析请填写'无视觉数据，基于纯量价分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "给交易员的一句明确建议（必须包含来源标记）"
+  "suggestion": "包含盈亏比计算、双重止损条件、A/B/C 三种情景的完整交易计划（必须包含来源标记）"
 }}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -315,11 +343,12 @@ def send_telegram(text):
 def main():
     for symbol in STOCKS:
         try:
-            hist, vol_ratio = get_recent_data(symbol)
+            hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
             if hist is None:
                 continue
 
-            initial = deepseek_judge_alert(symbol, hist, vol_ratio)
+            # 初判（传入量能细化数据）
+            initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
             if not initial.get("alert"):
                 continue
 
@@ -344,7 +373,7 @@ def main():
             news = search_news(symbol)
             sentiment = deepseek_sentiment(symbol, news)
 
-            action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+            # 置信度标签
             conf_val = final.get("confidence", 50)
             if conf_val >= 80:
                 conf_tag = "🟢高置信度"
@@ -353,6 +382,8 @@ def main():
             else:
                 conf_tag = "🔴低置信度"
 
+            # 构建消息（包含追踪密钥）
+            action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             message = f"""
 🚨 *【{symbol}】异动预警* | 置信度：{conf_val}% {conf_tag}
 
@@ -367,6 +398,8 @@ def main():
 📰 *新闻情绪*：{sentiment}
 
 {action_emoji} *建议*：{final.get('suggestion','')}
+
+🔑 *追踪密钥*：`{symbol} | 观察中 | 基准价 {hist['Close'].iloc[-1]:.2f}`
 """
             send_telegram(message.strip())
             time.sleep(1)
