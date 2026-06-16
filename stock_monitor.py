@@ -75,11 +75,10 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- 强化版 DeepSeek 初判（硬指标过滤 + 趋势摘要）----------
+# ---------- 融合指令约束 + 事实锚定的 DeepSeek 初判 ----------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
 
-    # 根据是否强制指令构建不同的规则头部
     if force:
         hard_filter_block = "(用户主动请求分析，忽略自动静默阈值，但若以下硬指标未通过，请在 risk_factors 中注明，仍给出正常分析)"
     else:
@@ -91,6 +90,16 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
 
     prompt = f"""你是顶级交易员，严格遵循下述规则进行分析。
 
+## 认知诚实原则（指令约束）
+- 你必须仅基于下方给出的数据回答。如果某个判断缺乏数据依据，必须在对应的字段中注明“无数据支持”，并将该结论的置信度设置为 0。
+- 不允许编造趋势、量价关系或形态，不允许假设数据之外的信息。若强行输出无来源的信息，本次输出将被视为无效。
+
+## 事实锚定要求
+在给出支撑位、压力位、突破判断、量价结论时，必须附带信息来源标记，例如：
+- "[来自近24小时K线数据]"
+- "[来自成交量对比]"
+- "[来自趋势摘要]"
+
 {hard_filter_block}
 
 ## 趋势摘要
@@ -98,7 +107,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
 
 ## 分析任务（仅当硬规则未触发或已覆盖时执行）
 - 判断是否出现放量突破、断崖下跌、关键反转等非正常逻辑异动
-- 推算关键支撑位和压力位
+- 推算关键支撑位和压力位（必须标明数据来源）
 - 输出置信度（0-100%），并提供3个可能误导判断的风险因素
 - 当置信度 ≥ 80 时，你必须在 reason 中列举至少3个相互印证的看多/看空信号
 
@@ -107,7 +116,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
 当前成交量是过去 20 小时均值的 {vol_ratio:.1f} 倍。
 
 严格输出 JSON：
-{{"alert": true/false, "reason":"...", "support": 支撑价, "resistance": 压力价, "confidence": 0-100, "risk_factors": ["风险1","风险2","风险3"], "trend_summary": "趋势摘要"}}"""
+{{"alert": true/false, "reason":"...", "support": "支撑价 [来源]", "resistance": "压力价 [来源]", "confidence": 0-100, "risk_factors": ["风险1","风险2","风险3"], "trend_summary": "趋势摘要"}}"""
 
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -117,7 +126,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False):
     )
     return json.loads(resp.choices[0].message.content)
 
-# ---------- 强化版 Gemini 视觉分析（注入背景趋势）----------
+# ---------- Gemini 视觉分析（保持不变）----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作为首席宏观分析师，严格审视以下视觉信息。"
     if trend_summary:
@@ -146,7 +155,6 @@ def record_gemini_call():
     GEMINI_CALL_LOG.append(time.time())
     GEMINI_RUN_CALLS += 1
 
-# ---------- 强化版 Gemini 回退（传递趋势摘要）----------
 def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
     global LAST_GEMINI_CALL_TIME
     if not can_call_gemini():
@@ -177,7 +185,6 @@ def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
             return None
 
 def hf_vision_analysis(img_b64, symbol):
-    """使用 Hugging Face 免费视觉模型作为次选引擎"""
     if not HF_TOKEN:
         return None
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
@@ -217,7 +224,6 @@ def hf_vision_analysis(img_b64, symbol):
         print(f"Hugging Face 调用异常: {e}")
     return None
 
-# ---------- 强化版完整回退链（传递趋势摘要）----------
 def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
     if gemini_client:
         result = call_gemini_with_fallback(img_b64, symbol, trend_summary)
@@ -239,13 +245,27 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
+# ---------- 融合指令约束 + 事实锚定的最终辩论 ----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位专家（视觉分析）看完 K 线图后指出：\n{gemini_vision}\n请结合视觉分析修正你的判断。"
     else:
         expert_input = "系统暂无视觉分析数据。请仅基于上述量价数据（包含支撑压力与异动原因），独立给出最终的交易决策与具体建议。"
 
-    debate_prompt = f"""你之前对 {symbol} 的判断是：
+    debate_prompt = f"""你是顶级交易员，正在对一份初始分析进行最终裁决。
+
+## 认知诚实原则（指令约束）
+- 你必须仅基于你之前看到的量价数据、当前提供的视觉分析结论以及已有的风险因素进行判断。
+- 如果某个操作建议缺乏直接的数据或图形支撑，必须在 suggestion 中注明“该建议基于综合经验，缺乏直接量化指标”。
+- 不得编造未在上下文中出现的支撑/压力位或趋势。
+
+## 事实锚定要求
+最终输出的 suggestion 必须指明其逻辑来源，例如：
+- "[基于纯量价分析]"
+- "[基于视觉分析对假突破的确认]"
+- "[基于新闻情绪与量价共振]"
+
+你之前对 {symbol} 的初步判断是：
 {json.dumps(initial_judge, ensure_ascii=False)}
 
 {expert_input}
@@ -260,7 +280,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     "visual_pattern": "若无视觉分析请填写'无视觉数据，基于纯量价分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "给交易员的一句明确建议（必须具体，例如：缩量回踩，建议等待突破xx元再介入，或跌破xx元止损）"
+  "suggestion": "给交易员的一句明确建议（必须包含来源标记）"
 }}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -299,12 +319,10 @@ def main():
             if hist is None:
                 continue
 
-            # 1. DeepSeek 初判（使用强化版 Prompt，force=False 默认启用硬指标过滤）
             initial = deepseek_judge_alert(symbol, hist, vol_ratio)
             if not initial.get("alert"):
                 continue
 
-            # 2. 视觉分析（注入趋势摘要）
             confidence = initial.get("confidence", 50)
             gemini_vision = None
 
@@ -312,7 +330,6 @@ def main():
                 if not should_skip_gemini(symbol, hist):
                     try:
                         img_b64 = generate_chart_b64(symbol, hist)
-                        # 从初判结果中提取趋势摘要
                         trend_desc = initial.get("trend_summary", "")
                         gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
                         if gemini_vision:
@@ -322,14 +339,11 @@ def main():
                 else:
                     print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
 
-            # 3. 最终决策
             final = deepseek_debate(symbol, initial, gemini_vision)
 
-            # 4. 新闻情绪
             news = search_news(symbol)
             sentiment = deepseek_sentiment(symbol, news)
 
-            # 5. 组装结构化推送（新增动态置信度标签）
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             conf_val = final.get("confidence", 50)
             if conf_val >= 80:
