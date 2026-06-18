@@ -105,7 +105,7 @@ def should_skip_gemini(symbol, hist):
     current_price = hist['Close'].iloc[-1]
     if time.time() - last_time < 1800:
         if abs(current_price - last_price) / last_price < 0.01:
-            print(f"{symbol} 近期已分析且波动小，跳过视觉分析")
+            print(f"{symbol} 近期已分析且波動小，跳過視覺分析")
             return True
     return False
 
@@ -115,48 +115,51 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
 
     extra_info = ""
     if turnover is not None:
-        extra_info += f"\n当前换手率：{turnover:.2f}%"
+        extra_info += f"\n當前換手率：{turnover:.2f}%"
     if open_hour_ratio is not None:
-        extra_info += f"\n开盘第一小时量比（相对过去5日同时段均值）：{open_hour_ratio:.2f}"
+        extra_info += f"\n開盤第一小時量比（相對過去5日同時段均值）：{open_hour_ratio:.2f}"
 
     if force:
-        hard_filter_block = "(用户主动请求分析，忽略自动静默阈值，但若以下硬指标未通过，请在 risk_factors 中注明，仍给出正常分析)"
+        hard_filter_block = "(用戶主動請求分析，忽略自動靜默閾值，但若以下硬指標未通過，請在 risk_factors 中註明，仍給出正常分析)"
     else:
-        hard_filter_block = f"""## 硬性过滤规则（静默阈值）
-请先执行以下检查，若触发则直接返回 alert: false，除非发现明确的反转形态（头肩底、双底、楔形突破、早晨之星、镊底等）可将其覆盖：
-1. 成交量倍数 < 2.0，且未出现上述底部形态 → alert: false, confidence: 0, reason: "量能不足且无底部反转形态"
-2. 价格未突破过去20小时最高价，且未出现破位下跌 → alert: false, confidence: 10, reason: "价格未突破前高，无突破信号"
-3. 若换手率 > 5% 且价格涨幅 < 1%（滞涨），必须在 reason 中注明“派发风险”，但仍可继续分析（alert 可为 true）"""
+        hard_filter_block = f"""## 硬性過濾規則（靜默閾值）
+請先執行以下檢查，若觸發則直接返回 alert: false，除非發現明確的反轉形態（頭肩底、雙底、楔形突破、早晨之星、鑷底等）可將其覆蓋：
+1. 成交量倍數 < 2.0，且未出現上述底部形態 → alert: false, confidence: 0, reason: "量能不足且無底部反轉形態"
+2. 價格未突破過去20小時最高價，且未出現破位下跌 → alert: false, confidence: 10, reason: "價格未突破前高，無突破訊號"
+3. 若換手率 > 5% 且價格漲幅 < 1%（滯漲），必須在 reason 中註明「派發風險」，但仍可繼續分析（alert 可為 true）"""
 
-    prompt = f"""你是顶级交易员，严格遵循下述规则进行分析。
+    prompt = f"""你是頂級交易員，嚴格遵循下述規則進行分析。
 
-## 认知诚实原则（指令约束）
-- 你必须仅基于下方给出的数据回答。如果某个判断缺乏数据依据，必须在对应的字段中注明“无数据支持”，并将该结论的置信度设置为 0。
-- 不允许编造趋势、量价关系或形态，不允许假设数据之外的信息。若强行输出无来源的信息，本次输出将被视为无效。
+## 語言要求
+- 你必須全程使用**繁體中文（台灣/香港習慣）**回答所有文字欄位（如 reason, support, resistance, trend_summary 等）。
 
-## 事实锚定要求
-在给出支撑位、压力位、突破判断、量价结论时，必须附带信息来源标记，例如：
-- "[来自近24小时K线数据]"
-- "[来自成交量对比]"
-- "[来自趋势摘要]"
+## 認知誠實原則（指令約束）
+- 你必須僅基於下方給出的數據回答。如果某個判斷缺乏數據依據，必須在對應的欄位中註明「無數據支持」，並將該結論的置信度設置為 0。
+- 不允許編造趨勢、量價關係或形態，不允許假設數據之外的信息。若強行輸出無來源的信息，本次輸出將被視為無效。
+
+## 事實錨定要求
+在給出支撐位、壓力位、突破判斷、量價結論時，必須附帶信息來源標記，例如：
+- "[來自近24小時K線數據]"
+- "[來自成交量對比]"
+- "[來自趨勢摘要]"
 
 {hard_filter_block}
 
-## 趋势摘要
-用一句话总结过去24小时的价格运行轨迹及当前位置。
+## 趨勢摘要
+用一句話總結過去24小時的價格運行軌跡及當前位置。
 
-## 分析任务（仅当硬规则未触发或已覆盖时执行）
-- 判断是否出现放量突破、断崖下跌、关键反转等非正常逻辑异动
-- 推算关键支撑位和压力位（必须标明数据来源）
-- 输出置信度（0-100%），并提供3个可能误导判断的风险因素
-- 当置信度 ≥ 80 时，你必须在 reason 中列举至少3个相互印证的看多/看空信号
+## 分析任務（僅當硬規則未觸發或已覆蓋時執行）
+- 判斷是否出現放量突破、斷崖下跌、關鍵反轉等非正常邏輯異動
+- 推算關鍵支撐位和壓力位（必須標明數據來源）
+- 輸出置信度（0-100%），並提供3個可能誤導判斷的風險因素
+- 當置信度 ≥ 80 時，你必須在 reason 中列舉至少3個相互印證的看多/看空訊號
 
-以下是 {symbol} 近 24 小时数据：
+以下是 {symbol} 近 24 小時數據：
 {data_text}
-当前成交量是过去 20 小时均值的 {vol_ratio:.1f} 倍。{extra_info}
+當前成交量是過去 20 小時均值的 {vol_ratio:.1f} 倍。{extra_info}
 
-严格输出 JSON：
-{{"alert": true/false, "reason":"...", "support": "支撑价 [来源]", "resistance": "压力价 [来源]", "confidence": 0-100, "risk_factors": ["风险1","风险2","风险3"], "trend_summary": "趋势摘要"}}"""
+嚴格輸出 JSON（確保所有 Value 皆為繁體中文）：
+{{"alert": true/false, "reason":"...", "support": "支撐價 [來源]", "resistance": "壓力價 [來源]", "confidence": 0-100, "risk_factors": ["風險1","風險2","風險3"], "trend_summary": "趨勢摘要"}}"""
 
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -168,10 +171,10 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
 
 # ---------- Gemini 视觉分析 ----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
-    base_prompt = "作为首席宏观分析师，严格审视以下视觉信息。"
+    base_prompt = "作為首席宏觀分析師，嚴格審視以下視覺信息，並全程使用繁體中文回答。"
     if trend_summary:
-        base_prompt += f"\n【背景趋势】{trend_summary}"
-    prompt = base_prompt + "\n请结合上述趋势背景分析这张 K 线图，重点回答：\n1. 当前形态及所处阶段。\n2. 是否存在假突破、背离或骗线信号？需与背景趋势交叉验证。\n3. 量价关系是否健康？给出简洁结论。"
+        base_prompt += f"\n【背景趨勢】{trend_summary}"
+    prompt = base_prompt + "\n請結合上述趨勢背景分析這張 K 線圖，重點回答：\n1. 當前形態及所處階段。\n2. 是否存在假突破、背離或騙線訊號？需與背景趨勢交叉驗證。\n3. 量價關係是否健康？給出簡潔結論。"
     image_bytes = base64.b64decode(img_b64)
     resp = gemini_client.models.generate_content(
         model=model,
@@ -224,7 +227,7 @@ def hf_vision_analysis(img_b64, symbol):
         return None
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {
-        "inputs": f"请分析这张 {symbol} 的 K 线图，观察形态、均线、MACD，指出假突破或骗线信号，给出简洁结论。",
+        "inputs": f"請分析這張 {symbol} 的 K 線圖，觀察形態、均線、MACD，指出假突破或騙線訊號，並用繁體中文給出簡潔結論。",
         "parameters": {"max_new_tokens": 200, "temperature": 0.1}
     }
     try:
@@ -266,48 +269,51 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
 # ---------- 最终辩论 ----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
-        expert_input = f"另一位专家（视觉分析）看完 K 线图后指出：\n{gemini_vision}\n请结合视觉分析修正你的判断。"
+        expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
     else:
-        expert_input = "系统暂无视觉分析数据。请仅基于上述量价数据，独立给出最终的交易决策与具体建议。"
+        expert_input = "系統暫無視覺分析數據。請僅基於上述量價數據，獨立給出最終的交易決策與具體建議。"
 
-    debate_prompt = f"""你是顶级交易员，正在对一份初始分析进行最终裁决。
+    debate_prompt = f"""你是頂級交易員，正在對一份初始分析進行最終裁決。
 
-## 认知诚实原则（指令约束）
-- 你必须仅基于量价数据、视觉分析结论以及风险因素进行判断。
-- 如果某个操作建议缺乏直接的数据或图形支撑，必须在 suggestion 中注明“该建议基于综合经验，缺乏直接量化指标”。
-- 不得编造未在上下文中出现的支撑/压力位或趋势。
+## 語言要求
+- **重要：你必須完全使用繁體中文（台灣/香港交易術語，例如：訊號、支撐、壓力、走勢）回覆所有 JSON 欄位。**
 
-## 事实锚定要求
-最终输出的 suggestion 必须指明其逻辑来源，例如：
-- "[基于纯量价分析]"
-- "[基于视觉分析对假突破的确认]"
-- "[基于新闻情绪与量价共振]"
+## 認知誠實原則（指令約束）
+- 你必須僅基於量價數據、視覺分析結論以及風險因素進行判斷。
+- 如果某個操作建議缺乏直接的數據或圖形支撐，必須在 suggestion 中註明「該建議基於綜合經驗，缺乏直接量化指標」。
+- 不得編造未在上下文中出現的支撐/壓力位或趨勢。
 
-## 高级交易计划要求
-你必须输出一个完整的交易计划，包含以下要素：
-1. **盈亏比矩阵**：根据建议的入场、止损和目标位，自动计算风险回报比（盈亏比）。若盈亏比低于 1:3，必须在 suggestion 中额外标注“博弈性价比低”。
-2. **双重止损机制**：止损必须包含空间止损（价格跌破 X 元）和时间止损（若在 Y 元上方横盘超过 Z 个交易日无法拉回，则失效）。若无法判断时间，可假设“横盘 2 个交易日失效”。
-3. **逻辑树预判（A/B/C 路径）**：
-   - 路径 A（达标）：若价格站稳 X 元，应如何调仓或加仓。
-   - 路径 B（失效）：若价格跌破 Y 元或时间止损触发，该信号作废。
-   - 路径 C（横盘）：若在 Z 区间震荡，建议最多持有几天或需等待的突破方向。
+## 事實錨定要求
+最終輸出的 suggestion 必須指明其邏輯來源，例如：
+- "[基於純量價分析]"
+- "[基於視覺分析對假突破的確認]"
+- "[基於新聞情緒與量價共振]"
 
-你之前对 {symbol} 的初步判断是：
+## 高級交易計劃要求
+你必須輸出一個完整的交易計劃，包含以下要素：
+1. **盈虧比矩陣**：根據建議的入場、止損和目標位，自動計算風險回報比（盈虧比）。若盈虧比低於 1:3，必須在 suggestion 中額外標註「博弈性價比低」。
+2. **雙重止損機制**：止損必須包含空間止損（價格跌破 X 元）和時間止損（若在 Y 元上方橫盤超過 Z 個交易日無法拉回，則失效）。若無法判斷時間，可假設「橫盤 2 個交易日失效」。
+3. **邏輯樹預判（A/B/C 路徑）**：
+   - 路徑 A（達標）：若價格站穩 X 元，應如何調倉或加倉。
+   - 路徑 B（失效）：若價格跌破 Y 元或時間止損觸發，該訊號作廢。
+   - 路徑 C（橫盤）：若在 Z 區間震盪，建議最多持有幾天或需等待的突破方向。
+
+你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
 
 {expert_input}
 
-输出最终结论，严格 JSON 格式：
+輸出最終結論，嚴格 JSON 格式（確保 Value 為繁體中文）：
 {{
   "action": "BUY/SELL/HOLD",
   "confidence": 0-100,
   "signal_breakdown": {{
     "price_action": "...",
     "volume_confirmation": "...",
-    "visual_pattern": "若无视觉分析请填写'无视觉数据，基于纯量价分析'"
+    "visual_pattern": "若無視覺分析請填寫 '無視覺數據，基於純量價分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "包含盈亏比计算、双重止损条件、A/B/C 三种情景的完整交易计划（必须包含来源标记）"
+  "suggestion": "包含盈虧比計算、雙重止損條件、A/B/C 三種情景的完整交易計劃（必須包含來源標記）"
 }}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -324,9 +330,9 @@ def search_news(symbol):
 
 def deepseek_sentiment(symbol, news_items):
     if not news_items:
-        return "暂无相关新闻"
+        return "暫無相關新聞"
     titles = "\n".join([n['title'] for n in news_items])
-    prompt = f"关于 {symbol} 的新闻标题：\n{titles}\n判断消息是利好出尽、真正反转或其他，一句话总结。"
+    prompt = f"關於 {symbol} 的新聞標題：\n{titles}\n判斷消息是利好出盡、真正反轉或其他，請用繁體中文一句話總結。"
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role":"user","content":prompt}],
@@ -415,22 +421,24 @@ def main():
 
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             base_price = hist['Close'].iloc[-1]
+            
+            # 全面繁體化的 Telegram 訊息模板
             message = f"""
-🚨 *【{symbol}】异动预警* | 置信度：{conf_val}% {conf_tag}
+🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
-📊 *信号拆解*
-  ▪ 价格行为：{final['signal_breakdown'].get('price_action','')}
-  ▪ 量能确认：{final['signal_breakdown'].get('volume_confirmation','')}
-  ▪ 图形形态：{final['signal_breakdown'].get('visual_pattern','')}
+📊 *訊號拆解*
+  ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
+  ▪ 量能確認：{final['signal_breakdown'].get('volume_confirmation','')}
+  ▪ 圖形形態：{final['signal_breakdown'].get('visual_pattern','')}
 
-⚠️ *风险提示*
+⚠️ *風險提示*
   {chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
 
-📰 *新闻情绪*：{sentiment}
+📰 *新聞情緒*：{sentiment}
 
-{action_emoji} *建议*：{final.get('suggestion','')}
+{action_emoji} *建議*：{final.get('suggestion','')}
 
-🔑 *追踪密钥*：`{symbol} | 观察中 | 基准价 {base_price:.2f}`
+🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
             send_telegram(message.strip())
 
