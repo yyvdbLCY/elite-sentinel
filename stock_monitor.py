@@ -297,6 +297,8 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
    - 路徑 A（達標）：若價格站穩 X 元，應如何調倉或加倉。
    - 路徑 B（失效）：若價格跌破 Y 元或時間止損觸發，該訊號作廢。
    - 路徑 C（橫盤）：若在 Z 區間震盪，建議最多持有幾天或需等待的突破方向。
+   
+請嚴格按照此換行格式輸出。
 
 你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
@@ -313,7 +315,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     "visual_pattern": "若無視覺分析請填寫 '無視覺數據，基於純量價分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "包含盈虧比計算、雙重止損條件、A/B/C 三種情景的完整交易計劃（必須包含來源標記）"
+  "suggestion": "（必須包含換行分隔的四個區塊）"
 }}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
@@ -422,7 +424,7 @@ def main():
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             base_price = hist['Close'].iloc[-1]
             
-            # 全面繁體化的 Telegram 訊息模板
+            # 修改後的 Telegram 訊息模板（建議獨立一行）
             message = f"""
 🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
@@ -436,7 +438,8 @@ def main():
 
 📰 *新聞情緒*：{sentiment}
 
-{action_emoji} *建議*：{final.get('suggestion','')}
+{action_emoji} *建議*：
+{final.get('suggestion','')}
 
 🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
@@ -452,3 +455,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+**❗ 格式要求（極重要）**  
+在最終輸出的 `suggestion` 欄位中，**必須使用換行符號 `\n` 將以下內容分成四個獨立的區塊**，每個區塊以標題開頭（如「盈虧比矩陣：」、「A路徑（達標）：」等），並確保每區塊獨立成行。範例格式如下：
