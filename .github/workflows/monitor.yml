@@ -2,8 +2,16 @@ name: 精銳哨兵監控
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # 每5分鐘運行一次（UTC）
-  workflow_dispatch:
+    # 1. 對應 HKT 08:30（只有這一筆）
+    - cron: '30 0 * * 1-5'
+
+    # 2. 對應 HKT 09:00 ~ 16:30（每小時的 0 分和 30 分）
+    - cron: '0,30 1-8 * * 1-5'
+
+    # 3. 對應 HKT 17:00 和 17:30（9:00 和 9:30 UTC）
+    - cron: '0,30 9 * * 1-5'
+
+  workflow_dispatch:   # 保留手動觸發
 
 jobs:
   run:
