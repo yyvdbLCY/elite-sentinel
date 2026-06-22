@@ -6,9 +6,16 @@ from oauth2client.service_account import ServiceAccountCredentials
 from openai import OpenAI
 from datetime import datetime, timedelta
 
+print("🚀 精銳哨兵正在啟動...")
+
 # ==================== 配置 ====================
-with open("stocks.txt", "r", encoding="utf-8") as f:
-    STOCKS = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+try:
+    with open("stocks.txt", "r", encoding="utf-8") as f:
+        STOCKS = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    print(f"📋 已載入 {len(STOCKS)} 隻監控標的")
+except Exception as e:
+    print(f"❌ 讀取 stocks.txt 失敗: {e}")
+    STOCKS = []
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -21,9 +28,13 @@ deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 # Gemini 客户端
 gemini_client = None
 if GEMINI_KEY:
-    from google import genai
-    from google.genai import types
-    gemini_client = genai.Client(api_key=GEMINI_KEY)
+    try:
+        from google import genai
+        from google.genai import types
+        gemini_client = genai.Client(api_key=GEMINI_KEY)
+        print("✅ Gemini 客戶端已初始化")
+    except Exception as e:
+        print(f"⚠️ Gemini 初始化失敗: {e}")
 
 # Hugging Face 视觉模型
 HF_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
@@ -38,13 +49,11 @@ GEMINI_RUN_CALLS = 0
 
 # ==================== 工具函数 ====================
 def get_recent_data(symbol):
-    """拉取数据，额外计算换手率和开盘第一小时量比"""
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
     if hist.empty:
         return None, None, None, None
 
-    # 成交量倍数
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
@@ -52,7 +61,6 @@ def get_recent_data(symbol):
     else:
         vol_ratio = 1.0
 
-    # 换手率
     turnover = None
     try:
         shares = ticker.info.get('sharesOutstanding')
@@ -61,7 +69,6 @@ def get_recent_data(symbol):
     except:
         pass
 
-    # 开盘第一小时量比
     open_hour_ratio = None
     try:
         today = hist[hist.index.date == hist.index[-1].date()]
@@ -80,7 +87,6 @@ def get_recent_data(symbol):
                     open_hour_ratio = first_hour_vol / avg_first if avg_first > 0 else None
     except:
         pass
-
     return hist, vol_ratio, turnover, open_hour_ratio
 
 def generate_chart_b64(symbol, hist):
@@ -109,10 +115,8 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- DeepSeek 初判 ----------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
-
     extra_info = ""
     if turnover is not None:
         extra_info += f"\n當前換手率：{turnover:.2f}%"
@@ -131,17 +135,14 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     prompt = f"""你是頂級交易員，嚴格遵循下述規則進行分析。
 
 ## 語言要求
-- 你必須全程使用**繁體中文（台灣/香港習慣）**回答所有文字欄位（如 reason, support, resistance, trend_summary 等）。
+- 你必須全程使用**繁體中文（台灣/香港習慣）**回答所有文字欄位。
 
 ## 認知誠實原則（指令約束）
 - 你必須僅基於下方給出的數據回答。如果某個判斷缺乏數據依據，必須在對應的欄位中註明「無數據支持」，並將該結論的置信度設置為 0。
 - 不允許編造趨勢、量價關係或形態，不允許假設數據之外的信息。若強行輸出無來源的信息，本次輸出將被視為無效。
 
 ## 事實錨定要求
-在給出支撐位、壓力位、突破判斷、量價結論時，必須附帶信息來源標記，例如：
-- "[來自近24小時K線數據]"
-- "[來自成交量對比]"
-- "[來自趨勢摘要]"
+在給出支撐位、壓力位、突破判斷、量價結論時，必須附帶信息來源標記。
 
 {hard_filter_block}
 
@@ -158,7 +159,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
 {data_text}
 當前成交量是過去 20 小時均值的 {vol_ratio:.1f} 倍。{extra_info}
 
-嚴格輸出 JSON（確保所有 Value 皆為繁體中文）：
+嚴格輸出 JSON：
 {{"alert": true/false, "reason":"...", "support": "支撐價 [來源]", "resistance": "壓力價 [來源]", "confidence": 0-100, "risk_factors": ["風險1","風險2","風險3"], "trend_summary": "趨勢摘要"}}"""
 
     resp = deepseek.chat.completions.create(
@@ -169,7 +170,6 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     )
     return json.loads(resp.choices[0].message.content)
 
-# ---------- Gemini 视觉分析 ----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作為首席宏觀分析師，嚴格審視以下視覺信息，並全程使用繁體中文回答。"
     if trend_summary:
@@ -266,7 +266,6 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
-# ---------- 最终辩论 ----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
@@ -342,11 +341,13 @@ def deepseek_sentiment(symbol, news_items):
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    if not resp.ok:
+        print(f"⚠️ Markdown 发送失败，降级纯文本")
+        safe = text.replace("*", "").replace("_", "").replace("`", "")
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe})
 
-# ---------- Google Sheets 自动记录 ----------
 def init_gsheet():
-    """初始化 Google Sheets 连接，返回 worksheet 对象"""
     if 'GDRIVE_CREDENTIALS' not in os.environ:
         print("未设置 GDRIVE_CREDENTIALS，跳过 Sheets 记录")
         return None
@@ -364,7 +365,6 @@ def init_gsheet():
         return None
 
 def append_alert(sheet, symbol, confidence, suggestion, base_price):
-    """向 Google Sheets 追加一行预警记录"""
     if sheet is None:
         return
     try:
@@ -377,9 +377,7 @@ def append_alert(sheet, symbol, confidence, suggestion, base_price):
 
 # ==================== 主流程 ====================
 def main():
-    # 初始化 Google Sheets（仅一次）
     sheet = init_gsheet()
-
     for symbol in STOCKS:
         try:
             hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
@@ -421,8 +419,7 @@ def main():
 
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             base_price = hist['Close'].iloc[-1]
-            
-            # 全面繁體化的 Telegram 訊息模板
+
             message = f"""
 🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
@@ -436,15 +433,13 @@ def main():
 
 📰 *新聞情緒*：{sentiment}
 
-{action_emoji} *建議*：{final.get('suggestion','')}
+{action_emoji} *建議*：
+{final.get('suggestion','')}
 
 🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
             send_telegram(message.strip())
-
-            # 自动记录到 Google Sheets
             append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
-
             time.sleep(1)
 
         except Exception as e:
