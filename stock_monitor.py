@@ -276,29 +276,36 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     debate_prompt = f"""你是頂級交易員，正在對一份初始分析進行最終裁決。
 
 ## 語言要求
-- **重要：你必須完全使用繁體中文（台灣/香港交易術語，例如：訊號、支撐、壓力、走勢）回覆所有 JSON 欄位。**
+- **全程使用繁體中文（台灣/香港交易術語，例如：訊號、支撐、壓力、走勢）**。
 
-## 認知誠實原則（指令約束）
-- 你必須僅基於量價數據、視覺分析結論以及風險因素進行判斷。
-- 如果某個操作建議缺乏直接的數據或圖形支撐，必須在 suggestion 中註明「該建議基於綜合經驗，缺乏直接量化指標」。
-- 不得編造未在上下文中出現的支撐/壓力位或趨勢。
+## 思考鏈要求（Reason CoT，內部推演，不輸出）
+在生成最終結論前，你必須先在內部完成以下四維推演：
+1. **技術面**：價格行為、關鍵點位、RSI/量能/均線趨勢。
+2. **資金與籌碼面**：成交量倍數、換手率、牛熊證街貨引力（若有）。
+3. **市場情緒**：新聞情緒傾向、宏觀流動性係數（若提供）。
+4. **風險校準**：交叉驗證多空矛盾，調整置信度，決定最終操作方向。
+
+推演完成後，請輸出最終結論，**嚴禁輸出任何思考過程、角色自述或分析步驟**。
+
+## 輸出格式要求
+請在 `suggestion` 欄位中按順序包含以下兩部分：
+
+**第一部分：戰術研判摘要（約 200 字）**
+直接給出核心依據、操作方向與關鍵風險，語言果斷、簡潔。
+
+**第二部分：完整交易計劃（結構化）**
+- 盈虧比矩陣：根據入場、止損、目標位計算，若低於 1:3 標註「博弈性價比低」。
+- 雙重止損：空間止損（價格跌破 X 元） + 時間止損（若在 Y 元上方橫盤超過 Z 個交易日則失效）。
+- A/B/C 路徑預判：
+  路徑 A（達標）：若價格站穩 X 元，應如何調倉。
+  路徑 B（失效）：若跌破 Y 元或時間止損觸發，訊號作廢。
+  路徑 C（橫盤）：若在區間震盪，建議持有天數或等待方向。
 
 ## 事實錨定要求
-最終輸出的 suggestion 必須指明其邏輯來源，例如：
+最終建議必須指明邏輯來源，例如：
 - "[基於純量價分析]"
 - "[基於視覺分析對假突破的確認]"
 - "[基於新聞情緒與量價共振]"
-
-## 高級交易計劃要求
-你必須輸出一個完整的交易計劃，包含以下要素：
-1. **盈虧比矩陣**：根據建議的入場、止損和目標位，自動計算風險回報比（盈虧比）。若盈虧比低於 1:3，必須在 suggestion 中額外標註「博弈性價比低」。
-2. **雙重止損機制**：止損必須包含空間止損（價格跌破 X 元）和時間止損（若在 Y 元上方橫盤超過 Z 個交易日無法拉回，則失效）。若無法判斷時間，可假設「橫盤 2 個交易日失效」。
-3. **邏輯樹預判（A/B/C 路徑）**：
-   - 路徑 A（達標）：若價格站穩 X 元，應如何調倉或加倉。
-   - 路徑 B（失效）：若價格跌破 Y 元或時間止損觸發，該訊號作廢。
-   - 路徑 C（橫盤）：若在 Z 區間震盪，建議最多持有幾天或需等待的突破方向。
-   
-請嚴格按照此換行格式輸出。
 
 你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
@@ -315,36 +322,18 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     "visual_pattern": "若無視覺分析請填寫 '無視覺數據，基於純量價分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "（必須包含換行分隔的四個區塊）"
+  "suggestion": "（第一部分：約 200 字戰術摘要；第二部分：結構化交易計劃）"
 }}"""
+
+    # 使用 DeepSeek-V4-Pro 模型
     resp = deepseek.chat.completions.create(
-        model="deepseek-chat",
+        model="deepseek-v4-pro",           # 指定 V4 Pro 大腦
         messages=[{"role":"user","content":debate_prompt}],
         temperature=0.1,
+        max_tokens=800,                    # 預留足夠空間輸出摘要+計劃
         response_format={"type":"json_object"}
     )
     return json.loads(resp.choices[0].message.content)
-
-def search_news(symbol):
-    url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
-    feed = feedparser.parse(url)
-    return [{"title": e.title, "link": e.link} for e in feed.entries[:5]]
-
-def deepseek_sentiment(symbol, news_items):
-    if not news_items:
-        return "暫無相關新聞"
-    titles = "\n".join([n['title'] for n in news_items])
-    prompt = f"關於 {symbol} 的新聞標題：\n{titles}\n判斷消息是利好出盡、真正反轉或其他，請用繁體中文一句話總結。"
-    resp = deepseek.chat.completions.create(
-        model="deepseek-chat",
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.2
-    )
-    return resp.choices[0].message.content
-
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 # ---------- Google Sheets 自动记录 ----------
 def init_gsheet():
