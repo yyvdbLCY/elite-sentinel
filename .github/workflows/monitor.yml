@@ -2,21 +2,19 @@ name: 精銳哨兵監控
 
 on:
   schedule:
-    # 1. 對應 HKT 08:30（只有這一筆）
-    - cron: '30 0 * * 1-5'
+    # 每30分鐘觸發一次，週一至週五，UTC 0:00-9:30（香港時間 08:00-17:30）
+    - cron: '0,30 0-9 * * 1-5'
+  workflow_dispatch:
 
-    # 2. 對應 HKT 09:00 ~ 16:30（每小時的 0 分和 30 分）
-    - cron: '0,30 1-8 * * 1-5'
-
-    # 3. 對應 HKT 17:00 和 17:30（9:00 和 9:30 UTC）
-    - cron: '0,30 9 * * 1-5'
-
-  workflow_dispatch:   # 保留手動觸發
+# 防止工作流實例堆積：新觸發會自動取消正在運行的舊實例
+concurrency:
+  group: elite-sentinel
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10          # 放寬執行時間，讓腳本慢慢跑
 
     steps:
       - uses: actions/checkout@v3
@@ -27,10 +25,10 @@ jobs:
         run: pip install -r requirements.txt
       - name: Execute Elite Sentinel
         env:
-          STOCK_LIST: ${{ secrets.STOCK_LIST }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python stock_monitor.py
