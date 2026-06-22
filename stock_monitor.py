@@ -53,14 +53,12 @@ def get_recent_data(symbol):
     hist = ticker.history(period="5d", interval="1h")
     if hist.empty:
         return None, None, None, None
-
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
         vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
     else:
         vol_ratio = 1.0
-
     turnover = None
     try:
         shares = ticker.info.get('sharesOutstanding')
@@ -68,7 +66,6 @@ def get_recent_data(symbol):
             turnover = (hist['Volume'].iloc[-1] / shares) * 100
     except:
         pass
-
     open_hour_ratio = None
     try:
         today = hist[hist.index.date == hist.index[-1].date()]
@@ -275,7 +272,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     debate_prompt = f"""你是頂級交易員，正在對一份初始分析進行最終裁決。
 
 ## 語言要求
-- **重要：你必須完全使用繁體中文（台灣/香港交易術語，例如：訊號、支撐、壓力、走勢）回覆所有 JSON 欄位。**
+- **重要：你必須完全使用繁體中文回覆所有 JSON 欄位。
 
 ## 認知誠實原則（指令約束）
 - 你必須僅基於量價數據、視覺分析結論以及風險因素進行判斷。
@@ -349,7 +346,6 @@ def send_telegram(text):
 
 def init_gsheet():
     if 'GDRIVE_CREDENTIALS' not in os.environ:
-        print("未设置 GDRIVE_CREDENTIALS，跳过 Sheets 记录")
         return None
     try:
         creds_dict = json.loads(os.environ['GDRIVE_CREDENTIALS'])
@@ -375,8 +371,75 @@ def append_alert(sheet, symbol, confidence, suggestion, base_price):
     except Exception as e:
         print(f"写入 Sheets 失败: {e}")
 
+# ==================== Telegram 指令處理 ====================
+def check_telegram_commands():
+    """檢查是否有新的 /analyze 指令，若有則強制分析並回覆"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    offset_file = "last_update_id.txt"
+    last_id = 0
+    if os.path.exists(offset_file):
+        with open(offset_file, "r") as f:
+            try:
+                last_id = int(f.read().strip())
+            except:
+                pass
+
+    params = {"timeout": 5, "offset": last_id + 1}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            return
+        for update in data["result"]:
+            update_id = update["update_id"]
+            message = update.get("message", {})
+            text = message.get("text", "")
+            chat_id = str(message.get("chat", {}).get("id", ""))
+            if chat_id != TELEGRAM_CHAT_ID:
+                continue
+
+            if text.startswith("/analyze"):
+                parts = text.split()
+                if len(parts) >= 2:
+                    target = parts[1].upper()
+                    send_telegram(f"🔍 收到強制分析指令：{target}，開始分析…")
+                    force_analyze(target)
+                else:
+                    send_telegram("⚠️ 格式錯誤，請使用：/analyze <代號>")
+
+            with open(offset_file, "w") as f:
+                f.write(str(update_id))
+    except Exception as e:
+        print(f"檢查 Telegram 指令時發生錯誤: {e}")
+
+def force_analyze(symbol):
+    """對指定股票進行一次完整分析並推送結果（無視靜默時段與過濾規則）"""
+    try:
+        hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
+        if hist is None:
+            send_telegram(f"❌ 無法取得 {symbol} 的數據，請檢查代號是否正確。")
+            return
+
+        # 強制初判（force=True）
+        initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
+
+        # 強制推送初判結果
+        send_telegram(f"📊 {symbol} 強制分析：\n{initial.get('reason', '無異動')}\n支撐 {initial.get('support','?')} / 壓力 {initial.get('resistance','?')}\n置信度 {initial.get('confidence','?')}%")
+
+        # 若 Gemini 可用且信號明顯，可再附加視覺分析
+        if gemini_client and initial.get("confidence", 0) >= 70:
+            send_telegram("👁️ 偵測到高置信度信號，稍後將嘗試 Gemini 視覺驗證…")
+            # 下一次定時觸發時會自動觸發視覺分析，此處不強制等待
+
+    except Exception as e:
+        send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
+
 # ==================== 主流程 ====================
 def main():
+    # 第一步：檢查是否有 Telegram 指令（/analyze）
+    check_telegram_commands()
+
+    # 第二步：常規監控
     sheet = init_gsheet()
     for symbol in STOCKS:
         try:
