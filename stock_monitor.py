@@ -349,37 +349,24 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
         response_format={"type":"json_object"}
     )
     try:
-        return json.loads(content)
+        result = json.loads(content)
+        # 确保返回的结构完整，不缺失必要字段
+        if "action" not in result or "suggestion" not in result:
+            raise ValueError("缺少必要字段")
+        return result
     except:
-        # 降级：返回基础结构
+        # 最终降级：返回完整的安全结构，保证不会因缺失字段而崩溃
         return {
             "action": "HOLD",
             "confidence": 50,
             "signal_breakdown": {
-                "price_action": "分析暫時不可用",
-                "volume_confirmation": "分析暫時不可用",
-                "visual_pattern": "分析暫時不可用"
+                "price_action": "戰術大腦暫時離線，請手動判斷。",
+                "volume_confirmation": "戰術大腦暫時離線，請手動判斷。",
+                "visual_pattern": "戰術大腦暫時離線，請手動判斷。"
             },
             "risk_factors": ["系統暫時無法完成分析"],
-            "suggestion": "戰術大腦暫時離線，請手動判斷。"
+            "suggestion": "戰術大腦暫時離線，請手動檢查該標的的走勢與量能。"
         }
-
-def search_news(symbol):
-    url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
-    feed = feedparser.parse(url)
-    return [{"title": e.title, "link": e.link} for e in feed.entries[:5]]
-
-def deepseek_sentiment(symbol, news_items):
-    if not news_items:
-        return "暫無相關新聞"
-    titles = "\n".join([n['title'] for n in news_items])
-    prompt = f"關於 {symbol} 的新聞標題：\n{titles}\n判斷消息是利好出盡、真正反轉或其他，請用繁體中文一句話總結。"
-    content = safe_deepseek_call(
-        messages=[{"role":"user","content":prompt}],
-        model="deepseek-chat",
-        max_tokens=100
-    )
-    return content if content else "新聞分析暫時不可用"
 
 # ---------- Telegram 推送 (Markdown + 纯文本降级) ----------
 def send_telegram(text):
