@@ -38,16 +38,21 @@ GEMINI_RUN_CALLS = 0
 
 # ==================== 工具函数 ====================
 def get_recent_data(symbol):
+    """拉取数据，额外计算换手率和开盘第一小时量比"""
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
     if hist.empty:
         return None, None, None, None
+
+    # 成交量倍数
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
         vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
     else:
         vol_ratio = 1.0
+
+    # 换手率
     turnover = None
     try:
         shares = ticker.info.get('sharesOutstanding')
@@ -55,6 +60,8 @@ def get_recent_data(symbol):
             turnover = (hist['Volume'].iloc[-1] / shares) * 100
     except:
         pass
+
+    # 开盘第一小时量比
     open_hour_ratio = None
     try:
         today = hist[hist.index.date == hist.index[-1].date()]
@@ -73,6 +80,7 @@ def get_recent_data(symbol):
                     open_hour_ratio = first_hour_vol / avg_first if avg_first > 0 else None
     except:
         pass
+
     return hist, vol_ratio, turnover, open_hour_ratio
 
 def generate_chart_b64(symbol, hist):
@@ -101,34 +109,10 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- DeepSeek 初判 (带空响应保护) ----------
-def safe_deepseek_call(messages, model="deepseek-chat", max_tokens=300, response_format=None):
-    """安全的 DeepSeek 调用，自动重试并处理空响应"""
-    for attempt in range(2):
-        try:
-            kwargs = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": max_tokens
-            }
-            if response_format:
-                kwargs["response_format"] = response_format
-            resp = deepseek.chat.completions.create(**kwargs)
-            content = resp.choices[0].message.content
-            if not content or content.strip() == "":
-                print(f"DeepSeek 返回空内容 (尝试 {attempt+1}/2)")
-                time.sleep(2)
-                continue
-            return content
-        except Exception as e:
-            print(f"DeepSeek 调用异常 (尝试 {attempt+1}/2): {e}")
-            time.sleep(2)
-    # 最终降级：返回安全的 JSON
-    return '{"alert": false, "reason": "API 回應異常", "confidence": 0}'
-
+# ---------- DeepSeek 初判 ----------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
+
     extra_info = ""
     if turnover is not None:
         extra_info += f"\n當前換手率：{turnover:.2f}%"
@@ -147,43 +131,43 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     prompt = f"""你是頂級交易員，嚴格遵循下述規則進行分析。
 
 ## 語言要求
-- 你必須全程使用**繁體中文（台灣/香港習慣）**回答所有文字欄位。
+- 你必須全程使用**繁體中文（台灣/香港習慣）**回答所有文字欄位（如 reason, support, resistance, trend_summary 等）。
 
 ## 認知誠實原則（指令約束）
 - 你必須僅基於下方給出的數據回答。如果某個判斷缺乏數據依據，必須在對應的欄位中註明「無數據支持」，並將該結論的置信度設置為 0。
 - 不允許編造趨勢、量價關係或形態，不允許假設數據之外的信息。若強行輸出無來源的信息，本次輸出將被視為無效。
 
 ## 事實錨定要求
-在給出支撐位、壓力位、突破判斷、量價結論時，必須附帶信息來源標記。
+在給出支撐位、壓力位、突破判斷、量價結論時，必須附帶信息來源標記，例如：
+- "[來自近24小時K線數據]"
+- "[來自成交量對比]"
+- "[來自趨勢摘要]"
 
 {hard_filter_block}
 
 ## 趨勢摘要
 用一句話總結過去24小時的價格運行軌跡及當前位置。
 
-## 分析任務
+## 分析任務（僅當硬規則未觸發或已覆蓋時執行）
 - 判斷是否出現放量突破、斷崖下跌、關鍵反轉等非正常邏輯異動
 - 推算關鍵支撐位和壓力位（必須標明數據來源）
 - 輸出置信度（0-100%），並提供3個可能誤導判斷的風險因素
-- 當置信度 ≥ 80 時，必須在 reason 中列舉至少3個相互印證的看多/看空訊號
+- 當置信度 ≥ 80 時，你必須在 reason 中列舉至少3個相互印證的看多/看空訊號
 
 以下是 {symbol} 近 24 小時數據：
 {data_text}
 當前成交量是過去 20 小時均值的 {vol_ratio:.1f} 倍。{extra_info}
 
-嚴格輸出 JSON：
+嚴格輸出 JSON（確保所有 Value 皆為繁體中文）：
 {{"alert": true/false, "reason":"...", "support": "支撐價 [來源]", "resistance": "壓力價 [來源]", "confidence": 0-100, "risk_factors": ["風險1","風險2","風險3"], "trend_summary": "趨勢摘要"}}"""
 
-    content = safe_deepseek_call(
-        messages=[{"role":"user","content":prompt}],
+    resp = deepseek.chat.completions.create(
         model="deepseek-chat",
-        max_tokens=400,
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.1,
         response_format={"type":"json_object"}
     )
-    try:
-        return json.loads(content)
-    except:
-        return {"alert": False, "reason": "初判解析失敗", "confidence": 0}
+    return json.loads(resp.choices[0].message.content)
 
 # ---------- Gemini 视觉分析 ----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
@@ -282,7 +266,7 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
-# ---------- 中央决策大脑（V4 Pro + 思考链）----------
+# ---------- 最终辩论 ----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
@@ -292,43 +276,34 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     debate_prompt = f"""你是頂級交易員，正在對一份初始分析進行最終裁決。
 
 ## 語言要求
-- **全程使用繁體中文**。
+- **重要：你必須完全使用繁體中文（台灣/香港交易術語，例如：訊號、支撐、壓力、走勢）回覆所有 JSON 欄位。**
 
-## 思考鏈要求（Reason CoT，內部推演，不輸出）
-在生成最終結論前，你必須先在內部完成以下四維推演：
-1. **技術面**：價格行為、關鍵點位、RSI/量能/均線趨勢。
-2. **資金與籌碼面**：成交量倍數、換手率、牛熊證街貨引力（若有）。
-3. **市場情緒**：新聞情緒傾向、宏觀流動性係數（若提供）。
-4. **風險校準**：交叉驗證多空矛盾，調整置信度，決定最終操作方向。
-
-推演完成後，請輸出最終結論，**嚴禁輸出任何思考過程、角色自述或分析步驟**。
-
-## 輸出格式要求
-請在 `suggestion` 欄位中按順序包含以下兩部分：
-
-**第一部分：戰術研判摘要（約 200 字）**
-直接給出核心依據、操作方向與關鍵風險，語言果斷、簡潔。
-
-**第二部分：完整交易計劃（結構化）**
-- 盈虧比矩陣：根據入場、止損、目標位計算，若低於 1:3 標註「博弈性價比低」。
-- 雙重止損：空間止損（價格跌破 X 元） + 時間止損（若在 Y 元上方橫盤超過 Z 個交易日則失效）。
-- A/B/C 路徑預判：
-  路徑 A（達標）：若價格站穩 X 元，應如何調倉。
-  路徑 B（失效）：若跌破 Y 元或時間止損觸發，訊號作廢。
-  路徑 C（橫盤）：若在區間震盪，建議持有天數或等待方向。
+## 認知誠實原則（指令約束）
+- 你必須僅基於量價數據、視覺分析結論以及風險因素進行判斷。
+- 如果某個操作建議缺乏直接的數據或圖形支撐，必須在 suggestion 中註明「該建議基於綜合經驗，缺乏直接量化指標」。
+- 不得編造未在上下文中出現的支撐/壓力位或趨勢。
 
 ## 事實錨定要求
-最終建議必須指明邏輯來源，例如：
+最終輸出的 suggestion 必須指明其邏輯來源，例如：
 - "[基於純量價分析]"
 - "[基於視覺分析對假突破的確認]"
 - "[基於新聞情緒與量價共振]"
+
+## 高級交易計劃要求
+你必須輸出一個完整的交易計劃，包含以下要素：
+1. **盈虧比矩陣**：根據建議的入場、止損和目標位，自動計算風險回報比（盈虧比）。若盈虧比低於 1:3，必須在 suggestion 中額外標註「博弈性價比低」。
+2. **雙重止損機制**：止損必須包含空間止損（價格跌破 X 元）和時間止損（若在 Y 元上方橫盤超過 Z 個交易日無法拉回，則失效）。若無法判斷時間，可假設「橫盤 2 個交易日失效」。
+3. **邏輯樹預判（A/B/C 路徑）**：
+   - 路徑 A（達標）：若價格站穩 X 元，應如何調倉或加倉。
+   - 路徑 B（失效）：若價格跌破 Y 元或時間止損觸發，該訊號作廢。
+   - 路徑 C（橫盤）：若在 Z 區間震盪，建議最多持有幾天或需等待的突破方向。
 
 你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
 
 {expert_input}
 
-輸出最終結論，嚴格 JSON 格式：
+輸出最終結論，嚴格 JSON 格式（確保 Value 為繁體中文）：
 {{
   "action": "BUY/SELL/HOLD",
   "confidence": 0-100,
@@ -338,51 +313,40 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     "visual_pattern": "若無視覺分析請填寫 '無視覺數據，基於純量價分析'"
   }},
   "risk_factors": ["..."],
-  "suggestion": "（第一部分：約 200 字戰術摘要；第二部分：結構化交易計劃）"
+  "suggestion": "包含盈虧比計算、雙重止損條件、A/B/C 三種情景的完整交易計劃（必須包含來源標記）"
 }}"""
-
-    # 使用 V4 Pro 大腦，帶安全保護
-    content = safe_deepseek_call(
+    resp = deepseek.chat.completions.create(
+        model="deepseek-chat",
         messages=[{"role":"user","content":debate_prompt}],
-        model="deepseek-v4-pro",
-        max_tokens=800,
+        temperature=0.1,
         response_format={"type":"json_object"}
     )
-    try:
-        result = json.loads(content)
-        # 确保返回的结构完整，不缺失必要字段
-        if "action" not in result or "suggestion" not in result:
-            raise ValueError("缺少必要字段")
-        return result
-    except:
-        # 最终降级：返回完整的安全结构，保证不会因缺失字段而崩溃
-        return {
-            "action": "HOLD",
-            "confidence": 50,
-            "signal_breakdown": {
-                "price_action": "戰術大腦暫時離線，請手動判斷。",
-                "volume_confirmation": "戰術大腦暫時離線，請手動判斷。",
-                "visual_pattern": "戰術大腦暫時離線，請手動判斷。"
-            },
-            "risk_factors": ["系統暫時無法完成分析"],
-            "suggestion": "戰術大腦暫時離線，請手動檢查該標的的走勢與量能。"
-        }
+    return json.loads(resp.choices[0].message.content)
 
-# ---------- Telegram 推送 (Markdown + 纯文本降级) ----------
+def search_news(symbol):
+    url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
+    feed = feedparser.parse(url)
+    return [{"title": e.title, "link": e.link} for e in feed.entries[:5]]
+
+def deepseek_sentiment(symbol, news_items):
+    if not news_items:
+        return "暫無相關新聞"
+    titles = "\n".join([n['title'] for n in news_items])
+    prompt = f"關於 {symbol} 的新聞標題：\n{titles}\n判斷消息是利好出盡、真正反轉或其他，請用繁體中文一句話總結。"
+    resp = deepseek.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.2
+    )
+    return resp.choices[0].message.content
+
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # 第一次尝试 Markdown
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
-    if resp.ok:
-        print("✅ Markdown 发送成功")
-        return
-    print(f"⚠️ Markdown 发送失败 ({resp.status_code})，降级为纯文本...")
-    # 降级：去除所有 Markdown 符号，纯文本重发
-    safe_text = text.replace("*", "").replace("_", "").replace("`", "")
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text})
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
 
 # ---------- Google Sheets 自动记录 ----------
 def init_gsheet():
+    """初始化 Google Sheets 连接，返回 worksheet 对象"""
     if 'GDRIVE_CREDENTIALS' not in os.environ:
         print("未设置 GDRIVE_CREDENTIALS，跳过 Sheets 记录")
         return None
@@ -400,6 +364,7 @@ def init_gsheet():
         return None
 
 def append_alert(sheet, symbol, confidence, suggestion, base_price):
+    """向 Google Sheets 追加一行预警记录"""
     if sheet is None:
         return
     try:
@@ -412,7 +377,9 @@ def append_alert(sheet, symbol, confidence, suggestion, base_price):
 
 # ==================== 主流程 ====================
 def main():
+    # 初始化 Google Sheets（仅一次）
     sheet = init_gsheet()
+
     for symbol in STOCKS:
         try:
             hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
@@ -455,27 +422,29 @@ def main():
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             base_price = hist['Close'].iloc[-1]
             
-            # 纯文本消息模板，安全无解析错误
+            # 全面繁體化的 Telegram 訊息模板
             message = f"""
-🚨 {symbol} 異動預警 | 置信度：{conf_val}% {conf_tag}
+🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
-📊 訊號拆解
+📊 *訊號拆解*
   ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
   ▪ 量能確認：{final['signal_breakdown'].get('volume_confirmation','')}
   ▪ 圖形形態：{final['signal_breakdown'].get('visual_pattern','')}
 
-⚠️ 風險提示
-{chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
+⚠️ *風險提示*
+  {chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
 
-📰 新聞情緒：{sentiment}
+📰 *新聞情緒*：{sentiment}
 
-{action_emoji} 建議：
-{final.get('suggestion','')}
+{action_emoji} *建議*：{final.get('suggestion','')}
 
-🔑 追蹤密鑰：{symbol} | 觀察中 | 基準價 {base_price:.2f}
+🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
             send_telegram(message.strip())
+
+            # 自动记录到 Google Sheets
             append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
+
             time.sleep(1)
 
         except Exception as e:
