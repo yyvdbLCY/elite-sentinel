@@ -101,6 +101,32 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
+# ---------- DeepSeek 初判 (带空响应保护) ----------
+def safe_deepseek_call(messages, model="deepseek-chat", max_tokens=300, response_format=None):
+    """安全的 DeepSeek 调用，自动重试并处理空响应"""
+    for attempt in range(2):
+        try:
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": max_tokens
+            }
+            if response_format:
+                kwargs["response_format"] = response_format
+            resp = deepseek.chat.completions.create(**kwargs)
+            content = resp.choices[0].message.content
+            if not content or content.strip() == "":
+                print(f"DeepSeek 返回空内容 (尝试 {attempt+1}/2)")
+                time.sleep(2)
+                continue
+            return content
+        except Exception as e:
+            print(f"DeepSeek 调用异常 (尝试 {attempt+1}/2): {e}")
+            time.sleep(2)
+    # 最终降级：返回安全的 JSON
+    return '{"alert": false, "reason": "API 回應異常", "confidence": 0}'
+
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     extra_info = ""
@@ -108,6 +134,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
         extra_info += f"\n當前換手率：{turnover:.2f}%"
     if open_hour_ratio is not None:
         extra_info += f"\n開盤第一小時量比（相對過去5日同時段均值）：{open_hour_ratio:.2f}"
+
     if force:
         hard_filter_block = "(用戶主動請求分析，忽略自動靜默閾值，但若以下硬指標未通過，請在 risk_factors 中註明，仍給出正常分析)"
     else:
@@ -147,14 +174,18 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
 嚴格輸出 JSON：
 {{"alert": true/false, "reason":"...", "support": "支撐價 [來源]", "resistance": "壓力價 [來源]", "confidence": 0-100, "risk_factors": ["風險1","風險2","風險3"], "trend_summary": "趨勢摘要"}}"""
 
-    resp = deepseek.chat.completions.create(
-        model="deepseek-chat",
+    content = safe_deepseek_call(
         messages=[{"role":"user","content":prompt}],
-        temperature=0.1,
+        model="deepseek-chat",
+        max_tokens=400,
         response_format={"type":"json_object"}
     )
-    return json.loads(resp.choices[0].message.content)
+    try:
+        return json.loads(content)
+    except:
+        return {"alert": False, "reason": "初判解析失敗", "confidence": 0}
 
+# ---------- Gemini 视觉分析 ----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作為首席宏觀分析師，嚴格審視以下視覺信息，並全程使用繁體中文回答。"
     if trend_summary:
@@ -310,15 +341,28 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
   "suggestion": "（第一部分：約 200 字戰術摘要；第二部分：結構化交易計劃）"
 }}"""
 
-    # 使用 V4 Pro 大腦
-    resp = deepseek.chat.completions.create(
-        model="deepseek-v4-pro",
+    # 使用 V4 Pro 大腦，帶安全保護
+    content = safe_deepseek_call(
         messages=[{"role":"user","content":debate_prompt}],
-        temperature=0.1,
+        model="deepseek-v4-pro",
         max_tokens=800,
         response_format={"type":"json_object"}
     )
-    return json.loads(resp.choices[0].message.content)
+    try:
+        return json.loads(content)
+    except:
+        # 降级：返回基础结构
+        return {
+            "action": "HOLD",
+            "confidence": 50,
+            "signal_breakdown": {
+                "price_action": "分析暫時不可用",
+                "volume_confirmation": "分析暫時不可用",
+                "visual_pattern": "分析暫時不可用"
+            },
+            "risk_factors": ["系統暫時無法完成分析"],
+            "suggestion": "戰術大腦暫時離線，請手動判斷。"
+        }
 
 def search_news(symbol):
     url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
@@ -330,17 +374,27 @@ def deepseek_sentiment(symbol, news_items):
         return "暫無相關新聞"
     titles = "\n".join([n['title'] for n in news_items])
     prompt = f"關於 {symbol} 的新聞標題：\n{titles}\n判斷消息是利好出盡、真正反轉或其他，請用繁體中文一句話總結。"
-    resp = deepseek.chat.completions.create(
-        model="deepseek-chat",
+    content = safe_deepseek_call(
         messages=[{"role":"user","content":prompt}],
-        temperature=0.2
+        model="deepseek-chat",
+        max_tokens=100
     )
-    return resp.choices[0].message.content
+    return content if content else "新聞分析暫時不可用"
 
+# ---------- Telegram 推送 (Markdown + 纯文本降级) ----------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    # 第一次尝试 Markdown
+    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    if resp.ok:
+        print("✅ Markdown 发送成功")
+        return
+    print(f"⚠️ Markdown 发送失败 ({resp.status_code})，降级为纯文本...")
+    # 降级：去除所有 Markdown 符号，纯文本重发
+    safe_text = text.replace("*", "").replace("_", "").replace("`", "")
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text})
 
+# ---------- Google Sheets 自动记录 ----------
 def init_gsheet():
     if 'GDRIVE_CREDENTIALS' not in os.environ:
         print("未设置 GDRIVE_CREDENTIALS，跳过 Sheets 记录")
@@ -414,23 +468,24 @@ def main():
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             base_price = hist['Close'].iloc[-1]
             
+            # 纯文本消息模板，安全无解析错误
             message = f"""
-🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
+🚨 {symbol} 異動預警 | 置信度：{conf_val}% {conf_tag}
 
-📊 *訊號拆解*
+📊 訊號拆解
   ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
   ▪ 量能確認：{final['signal_breakdown'].get('volume_confirmation','')}
   ▪ 圖形形態：{final['signal_breakdown'].get('visual_pattern','')}
 
-⚠️ *風險提示*
-  {chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
+⚠️ 風險提示
+{chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
 
-📰 *新聞情緒*：{sentiment}
+📰 新聞情緒：{sentiment}
 
-{action_emoji} *建議*：
+{action_emoji} 建議：
 {final.get('suggestion','')}
 
-🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
+🔑 追蹤密鑰：{symbol} | 觀察中 | 基準價 {base_price:.2f}
 """
             send_telegram(message.strip())
             append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
