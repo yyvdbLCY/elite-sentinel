@@ -112,6 +112,7 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
+# ---------- 调整后的 DeepSeek 初判（放宽阈值 + 保护视觉额度）----------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     extra_info = ""
@@ -123,10 +124,11 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     if force:
         hard_filter_block = "(用戶主動請求分析，忽略自動靜默閾值，但若以下硬指標未通過，請在 risk_factors 中註明，仍給出正常分析)"
     else:
-        hard_filter_block = f"""## 硬性過濾規則（靜默閾值）
-請先執行以下檢查，若觸發則直接返回 alert: false，除非發現明確的反轉形態（頭肩底、雙底、楔形突破、早晨之星、鑷底等）可將其覆蓋：
-1. 成交量倍數 < 2.0，且未出現上述底部形態 → alert: false, confidence: 0, reason: "量能不足且無底部反轉形態"
-2. 價格未突破過去20小時最高價，且未出現破位下跌 → alert: false, confidence: 10, reason: "價格未突破前高，無突破訊號"
+        # 🟢 放宽后的规则：量能门槛降至1.5，且不强制 false，改为降低置信度并标注
+        hard_filter_block = """## 硬性過濾規則（放寬版）
+請先執行以下檢查，根據結果調整置信度，但不強制攔截（除非完全無異動）：
+1. 若成交量倍數 < 1.5，且未出現明確反轉形態（頭肩底、雙底、楔形突破、早晨之星、鑷底等），請將置信度降低 15-20 點，並在 reason 中註明「量能偏弱」；若出現反轉形態，可維持原置信度。
+2. 若價格未突破過去20小時最高價，且未出現破位下跌，則設置 alert: false, confidence: 10, reason: "價格未突破前高，無突破訊號"（此條為硬性過濾，除非出現上述反轉形態可覆蓋）。
 3. 若換手率 > 5% 且價格漲幅 < 1%（滯漲），必須在 reason 中註明「派發風險」，但仍可繼續分析（alert 可為 true）"""
 
     prompt = f"""你是頂級交易員，嚴格遵循下述規則進行分析。
@@ -167,6 +169,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     )
     return json.loads(resp.choices[0].message.content)
 
+# ---------- 视觉分析相关函数保持不变 ----------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作為首席宏觀分析師，嚴格審視以下視覺信息，並全程使用繁體中文回答。"
     if trend_summary:
@@ -263,6 +266,7 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
+# ---------- 最终辩论（无变化）----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
@@ -373,7 +377,6 @@ def append_alert(sheet, symbol, confidence, suggestion, base_price):
 
 # ==================== Telegram 指令處理 ====================
 def check_telegram_commands():
-    """檢查是否有新的 /analyze 指令，若有則強制分析並回覆"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     offset_file = "last_update_id.txt"
     last_id = 0
@@ -413,33 +416,25 @@ def check_telegram_commands():
         print(f"檢查 Telegram 指令時發生錯誤: {e}")
 
 def force_analyze(symbol):
-    """對指定股票進行一次完整分析並推送結果（無視靜默時段與過濾規則）"""
     try:
         hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
         if hist is None:
             send_telegram(f"❌ 無法取得 {symbol} 的數據，請檢查代號是否正確。")
             return
 
-        # 強制初判（force=True）
         initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
-
-        # 強制推送初判結果
         send_telegram(f"📊 {symbol} 強制分析：\n{initial.get('reason', '無異動')}\n支撐 {initial.get('support','?')} / 壓力 {initial.get('resistance','?')}\n置信度 {initial.get('confidence','?')}%")
 
-        # 若 Gemini 可用且信號明顯，可再附加視覺分析
-        if gemini_client and initial.get("confidence", 0) >= 70:
+        if gemini_client and initial.get("confidence", 0) >= 80:   # 强制模式下也遵循高阈值
             send_telegram("👁️ 偵測到高置信度信號，稍後將嘗試 Gemini 視覺驗證…")
-            # 下一次定時觸發時會自動觸發視覺分析，此處不強制等待
 
     except Exception as e:
         send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
 
 # ==================== 主流程 ====================
 def main():
-    # 第一步：檢查是否有 Telegram 指令（/analyze）
     check_telegram_commands()
 
-    # 第二步：常規監控
     sheet = init_gsheet()
     for symbol in STOCKS:
         try:
@@ -454,6 +449,7 @@ def main():
             confidence = initial.get("confidence", 50)
             gemini_vision = None
 
+            # 🟢 视觉分析触发门槛提升至 80
             if (gemini_client or HF_TOKEN) and confidence >= 70:
                 if not should_skip_gemini(symbol, hist):
                     try:
@@ -474,11 +470,11 @@ def main():
 
             conf_val = final.get("confidence", 50)
             if conf_val >= 80:
-                conf_tag = "🟢高置信度"
+                conf_tag = "🟢強信號"
             elif conf_val >= 50:
-                conf_tag = "🟡中置信度"
+                conf_tag = "🟡弱信號（未經視覺驗證）"
             else:
-                conf_tag = "🔴低置信度"
+                conf_tag = "🔴微弱信號"
 
             action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
             base_price = hist['Close'].iloc[-1]
