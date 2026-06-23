@@ -422,11 +422,61 @@ def force_analyze(symbol):
             send_telegram(f"❌ 無法取得 {symbol} 的數據，請檢查代號是否正確。")
             return
 
+        # 強制初判（force=True）
         initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
-        send_telegram(f"📊 {symbol} 強制分析：\n{initial.get('reason', '無異動')}\n支撐 {initial.get('support','?')} / 壓力 {initial.get('resistance','?')}\n置信度 {initial.get('confidence','?')}%")
 
-        if gemini_client and initial.get("confidence", 0) >= 80:   # 强制模式下也遵循高阈值
-            send_telegram("👁️ 偵測到高置信度信號，稍後將嘗試 Gemini 視覺驗證…")
+        # 尝试视觉分析
+        gemini_vision = None
+        if (gemini_client or HF_TOKEN) and initial.get("confidence", 0) >= 80:
+            if not should_skip_gemini(symbol, hist):
+                try:
+                    img_b64 = generate_chart_b64(symbol, hist)
+                    trend_desc = initial.get("trend_summary", "")
+                    gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
+                    if gemini_vision:
+                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                except Exception as e:
+                    print(f"强制分析视觉异常: {e}")
+
+        # 最终辩论
+        final = deepseek_debate(symbol, initial, gemini_vision)
+
+        # 新闻情绪
+        news = search_news(symbol)
+        sentiment = deepseek_sentiment(symbol, news)
+
+        conf_val = final.get("confidence", 50)
+        if conf_val >= 80:
+            conf_tag = "🟢強信號"
+        elif conf_val >= 50:
+            conf_tag = "🟡弱信號（未經視覺驗證）"
+        else:
+            conf_tag = "🔴微弱信號"
+
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+        base_price = hist['Close'].iloc[-1]
+
+        # 构建与常规预警一致的消息格式
+        message = f"""
+🚨 *【{symbol}】強制分析結果* | 置信度：{conf_val}% {conf_tag}
+
+📊 *訊號拆解*
+  ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
+  ▪ 量能確認：{final['signal_breakdown'].get('volume_confirmation','')}
+  ▪ 圖形形態：{final['signal_breakdown'].get('visual_pattern','')}
+
+⚠️ *風險提示*
+  {chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
+
+📰 *新聞情緒*：{sentiment}
+
+{action_emoji} *建議*：
+{final.get('suggestion','')}
+
+🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
+"""
+        send_telegram(message.strip())
+        append_alert(None, symbol, conf_val, final.get('suggestion', ''), base_price)
 
     except Exception as e:
         send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
