@@ -2,11 +2,9 @@ name: 精銳哨兵監控
 
 on:
   schedule:
-    # 每15分鐘觸發一次，週一至週五，UTC 0:00-9:30（香港時間 08:00-17:30）
     - cron: '0,15,30,45 0-9 * * 1-5'
   workflow_dispatch:
 
-# 防止工作流實例堆積：新觸發會自動取消正在運行的舊實例
 concurrency:
   group: elite-sentinel
   cancel-in-progress: true
@@ -14,15 +12,20 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10          # 放寬執行時間，讓腳本慢慢跑
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}   # 必须提供 token 才能推送
+
       - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Execute Elite Sentinel
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
@@ -32,3 +35,10 @@ jobs:
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python stock_monitor.py
+
+      - name: Commit last_update_id
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'actions@github.com'
+          git add last_update_id.txt
+          git diff --quiet && git diff --staged --quiet || (git commit -m "update telegram offset" && git push)
