@@ -87,6 +87,8 @@ def get_recent_data(symbol):
     return hist, vol_ratio, turnover, open_hour_ratio
 
 def generate_chart_b64(symbol, hist):
+    import io
+    import base64
     import warnings
     import matplotlib
     import matplotlib.pyplot as plt
@@ -103,6 +105,7 @@ def generate_chart_b64(symbol, hist):
 
         data = hist.tail(80).copy()
         if len(data) < 20:
+            import mplfinance as mpf
             buf = io.BytesIO()
             savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
             mpf.plot(data, type='candle', style='charles',
@@ -381,11 +384,12 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
 ## 高級交易計劃要求
 你必須輸出一個完整的交易計劃，並在 suggestion 字串中**嚴格使用換行 (\n) 將以下每個要素獨立成行**：
 - 第一行：核心操作建議與方向（包括入場點、止損點、目標位、盈虧比結果，若低於 1:3 標註「博弈性價比低」）
-- 第二行：空間止損條件
-- 第三行：時間止損條件
-- 第四行：A路徑（達標）
-- 第五行：B路徑（失效）
-- 第六行：C路徑（橫盤）
+- 第二行：
+- 第三行：空間止損條件
+- 第四行：時間止損條件
+- 第五行：A路徑（達標）
+- 第六行：B路徑（失效）
+- 第七行：C路徑（橫盤）
 
 你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
@@ -404,6 +408,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
   "risk_factors": ["..."],
   "suggestion": "必須用換行分隔的六行交易計劃，範例格式：
 建議：基於純量價分析，建議在80.15附近買入，目標82.40，止損79.00，盈虧比1.96:1（低於3:1，博弈性價比低）
+
 空間止損：跌破79.00離場
 時間止損：若在80.00上方橫盤2個交易日無法拉回則失效
 A路徑（達標）：若站穩82.40，可加倉至84.00
