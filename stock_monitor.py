@@ -478,7 +478,7 @@ def analyze_with_deepseek(hsi_data, spacetime, breadth, breadth_signal, tnx_val,
     vision_block = f"\n【🔴 K線型態視覺報告】：\n{vision_report}\n" if vision_report else ""
 
     # 💡 重構後的精簡 Prompt：嚴禁模型輸出重複的摘要標題，直接輸出指令與點位
-    prompt = f"""你是資深港股策略師。請結合量價、牛熊證衍生品籌碼、市寬以及【視覺型態報告】，給出直接的戰術行動。
+    prompt = f"""你是資深港股策略師。請結合量價、牛熊證衍生品籌碼、市寬以及【視覺型態報告】，在生成最終輸出前，請先在內部完成以下思考鏈推演（思考過程不輸出）：
 
 【行情】{hsi_data['price_str']}（{hsi_data['change']}）
 【數據面板】 
