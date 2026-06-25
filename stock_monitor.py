@@ -1,4 +1,4 @@
-import os, json, base64, io, requests, feedparser, time
+import os, json, base64, io, requests, feedparser, time, sys
 import yfinance as yf
 import mplfinance as mpf
 import gspread
@@ -8,16 +8,22 @@ from datetime import datetime, timedelta
 
 print("🚀 精銳哨兵正在啟動...")
 
-# ==================== 配置 ====================
+# ==================== 配置 (分流港美股版) ====================
+# 💡 核心修改：從外部接收參數 (預設為 HK)，動態讀取對應的檔案
+market_type = sys.argv[1].upper() if len(sys.argv) > 1 else "HK"
+filename = "stocks_hk.txt" if market_type == "HK" else "stocks_us.txt"
+
 try:
-    with open("stocks.txt", "r", encoding="utf-8") as f:
+    with open(filename, "r", encoding="utf-8") as f:
         STOCKS = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    print(f"📋 已載入 {len(STOCKS)} 隻監控標的")
+    print(f"📋 已載入 {market_type} 名單，共 {len(STOCKS)} 隻監控標的")
 except Exception as e:
-    print(f"❌ 讀取 stocks.txt 失敗: {e}")
+    print(f"❌ 讀取 {filename} 失敗: {e}")
     STOCKS = []
+
+# 💡 核心修改：配合分流，進度紀錄檔案也分開為 hk 和 us，互不干擾
 def get_and_update_next_index(total_stocks):
-    INDEX_FILE = "current_index.txt"
+    INDEX_FILE = f"current_index_{market_type.lower()}.txt"
     # 1. 讀取上一次排隊到第幾隻
     if os.path.exists(INDEX_FILE):
         with open(INDEX_FILE, "r") as f:
