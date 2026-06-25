@@ -1,30 +1,23 @@
-name: 精銳哨兵監控
-
+name: 精銳哨兵監控 - 港股
 on:
   workflow_dispatch:
-
 concurrency:
-  group: elite-sentinel
+  group: elite-sentinel-hk
   cancel-in-progress: true
-
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}   # 必须提供 token 才能推送
-
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Execute Elite Sentinel
+      - name: Execute Elite Sentinel HK
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -32,11 +25,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python stock_monitor.py
+        run: python stock_monitor.py HK   # 💡 這裡加上了 HK 參數
 
       - name: Commit last_update_id
         run: |
           git config --global user.name 'github-actions'
           git config --global user.email 'actions@github.com'
-          git add last_update_id.txt
-          git diff --quiet && git diff --staged --quiet || (git commit -m "update telegram offset" && git push)
+          git add last_update_id.txt current_index_hk.txt   # 💡 順便自動保存港股排隊進度
+          git diff --quiet && git diff --staged --quiet || (git commit -m "update hk offset" && git push)
