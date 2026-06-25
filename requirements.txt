@@ -7,8 +7,4 @@ google-genai
 gspread
 oauth2client
 python-telegram-bot
-beautifulsoup4
-akshare
-fredapi
-pandas
-matplotlib
+
