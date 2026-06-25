@@ -9,19 +9,23 @@ from datetime import datetime, timedelta
 print("🚀 精銳哨兵正在啟動...")
 
 # ==================== 配置 ====================
-try:
-    with open("stocks.txt", "r", encoding="utf-8") as f:
-        STOCKS = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    print(f"📋 已載入 {len(STOCKS)} 隻監控標的")
-except Exception as e:
-    print(f"❌ 讀取 stocks.txt 失敗: {e}")
-    STOCKS = []
+def load_stock_list(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    except Exception:
+        return []
+
+STOCKS_HK = load_stock_list("stocks_hk.txt")
+STOCKS_US = load_stock_list("stocks_us.txt")
+print(f"📋 港股 {len(STOCKS_HK)} 隻 | 美股 {len(STOCKS_US)} 隻")
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+MARKET = os.environ.get("MARKET", "").upper()   # 新增：由外部傳入 HK 或 US
 
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
@@ -47,7 +51,7 @@ GEMINI_CALL_LOG = []
 GEMINI_PER_RUN_LIMIT = 3
 GEMINI_RUN_CALLS = 0
 
-# ==================== 工具函数 ====================
+# ==================== 工具函数 (保持不变) ====================
 def get_recent_data(symbol):
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
@@ -112,7 +116,6 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- 调整后的 DeepSeek 初判（放宽阈值 + 保护视觉额度）----------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     extra_info = ""
@@ -124,7 +127,6 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     if force:
         hard_filter_block = "(用戶主動請求分析，忽略自動靜默閾值，但若以下硬指標未通過，請在 risk_factors 中註明，仍給出正常分析)"
     else:
-        # 🟢 放宽后的规则：量能门槛降至1.5，且不强制 false，改为降低置信度并标注
         hard_filter_block = """## 硬性過濾規則（放寬版）
 請先執行以下檢查，根據結果調整置信度，但不強制攔截（除非完全無異動）：
 1. 若成交量倍數 < 1.5，且未出現明確反轉形態（頭肩底、雙底、楔形突破、早晨之星、鑷底等），請將置信度降低 15-20 點，並在 reason 中註明「量能偏弱」；若出現反轉形態，可維持原置信度。
@@ -266,7 +268,7 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
-# ---------- 最终辩论（无变化）----------
+# ---------- 最终辩论 ----------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
@@ -294,9 +296,10 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
 - 第一行：核心操作建議與方向（包括入場點、止損點、目標位、盈虧比結果，若低於 1:3 標註「博弈性價比低」）
 - 第二行：空間止損條件
 - 第三行：時間止損條件
-- 第四行：A路徑（達標）
-- 第五行：B路徑（失效）
-- 第六行：C路徑（橫盤）
+- 第四行：
+- 第五行：A路徑（達標）
+- 第六行：B路徑（失效）
+- 第七行：C路徑（橫盤）
 
 你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
@@ -317,6 +320,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
 建議：基於純量價分析，建議在80.15附近買入，目標82.40，止損79.00，盈虧比1.96:1（低於3:1，博弈性價比低）
 空間止損：跌破79.00離場
 時間止損：若在80.00上方橫盤2個交易日無法拉回則失效
+
 A路徑（達標）：若站穩82.40，可加倉至84.00
 B路徑（失效）：若跌破79.00或時間止損觸發，訊號作廢
 C路徑（橫盤）：若在79.30-80.50震盪，建議持有最多3個交易日等待突破"
@@ -428,10 +432,8 @@ def force_analyze(symbol):
             send_telegram(f"❌ 無法取得 {symbol} 的數據，請檢查代號是否正確。")
             return
 
-        # 強制初判（force=True）
         initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
 
-        # 尝试视觉分析
         gemini_vision = None
         if (gemini_client or HF_TOKEN) and initial.get("confidence", 0) >= 80:
             if not should_skip_gemini(symbol, hist):
@@ -444,10 +446,8 @@ def force_analyze(symbol):
                 except Exception as e:
                     print(f"强制分析视觉异常: {e}")
 
-        # 最终辩论
         final = deepseek_debate(symbol, initial, gemini_vision)
 
-        # 新闻情绪
         news = search_news(symbol)
         sentiment = deepseek_sentiment(symbol, news)
 
@@ -462,7 +462,6 @@ def force_analyze(symbol):
         action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
         base_price = hist['Close'].iloc[-1]
 
-        # 构建与常规预警一致的消息格式
         message = f"""
 🚨 *【{symbol}】強制分析結果* | 置信度：{conf_val}% {conf_tag}
 
@@ -487,55 +486,50 @@ def force_analyze(symbol):
     except Exception as e:
         send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
 
-# ==================== 主流程 ====================
-def main():
-    check_telegram_commands()
+# ==================== 个股处理函数（供轮询和全量扫描调用） ====================
+def process_symbol(symbol, sheet):
+    try:
+        hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
+        if hist is None:
+            return
 
-    sheet = init_gsheet()
-    for symbol in STOCKS:
-        try:
-            hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
-            if hist is None:
-                continue
+        initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
+        if not initial.get("alert"):
+            return
 
-            initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
-            if not initial.get("alert"):
-                continue
+        confidence = initial.get("confidence", 50)
+        gemini_vision = None
 
-            confidence = initial.get("confidence", 50)
-            gemini_vision = None
-
-            # 🟢 视觉分析触发门槛提升至 80
-            if (gemini_client or HF_TOKEN) and confidence >= 70:
-                if not should_skip_gemini(symbol, hist):
-                    try:
-                        img_b64 = generate_chart_b64(symbol, hist)
-                        trend_desc = initial.get("trend_summary", "")
-                        gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
-                        if gemini_vision:
-                            LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
-                    except Exception as e:
-                        print(f"视觉分析流程异常: {e}")
-                else:
-                    print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
-
-            final = deepseek_debate(symbol, initial, gemini_vision)
-
-            news = search_news(symbol)
-            sentiment = deepseek_sentiment(symbol, news)
-
-            conf_val = final.get("confidence", 50)
-            if conf_val >= 80:
-                conf_tag = "🟢強信號"
-            elif conf_val >= 50:
-                conf_tag = "🟡弱信號（未經視覺驗證）"
+        if (gemini_client or HF_TOKEN) and confidence >= 70:
+            if not should_skip_gemini(symbol, hist):
+                try:
+                    img_b64 = generate_chart_b64(symbol, hist)
+                    trend_desc = initial.get("trend_summary", "")
+                    gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
+                    if gemini_vision:
+                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                except Exception as e:
+                    print(f"视觉分析流程异常: {e}")
             else:
-                conf_tag = "🔴微弱信號"
+                print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
 
-            action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
-            base_price = hist['Close'].iloc[-1]
+        final = deepseek_debate(symbol, initial, gemini_vision)
 
-            message = f"""
+        news = search_news(symbol)
+        sentiment = deepseek_sentiment(symbol, news)
+
+        conf_val = final.get("confidence", 50)
+        if conf_val >= 80:
+            conf_tag = "🟢強信號"
+        elif conf_val >= 50:
+            conf_tag = "🟡弱信號（未經視覺驗證）"
+        else:
+            conf_tag = "🔴微弱信號"
+
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+        base_price = hist['Close'].iloc[-1]
+
+        message = f"""
 🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
 📊 *訊號拆解*
@@ -553,12 +547,63 @@ def main():
 
 🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
-            send_telegram(message.strip())
-            append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
-            time.sleep(1)
+        send_telegram(message.strip())
+        append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
+        time.sleep(1)
 
-        except Exception as e:
-            print(f"处理 {symbol} 时发生错误: {e}")
+    except Exception as e:
+        print(f"处理 {symbol} 时发生错误: {e}")
+
+# ==================== 主流程 ====================
+def main():
+    # 1. 检查 Telegram 指令
+    check_telegram_commands()
+
+    # 2. 初始化 Google Sheets
+    sheet = init_gsheet()
+
+    # 3. 根据环境变量决定运行模式
+    if MARKET in ("HK", "US"):
+        # 轮询模式：一次只处理一只股票
+        if MARKET == "HK":
+            STOCKS = STOCKS_HK
+            INDEX_FILE = "current_index_hk.txt"
+        else:
+            STOCKS = STOCKS_US
+            INDEX_FILE = "current_index_us.txt"
+
+        if not STOCKS:
+            print(f"⚠️ {MARKET} 股票清單為空，結束運行。")
+            return
+
+        # 读取当前索引
+        current_index = 0
+        if os.path.exists(INDEX_FILE):
+            with open(INDEX_FILE, "r") as f:
+                try:
+                    current_index = int(f.read().strip())
+                except:
+                    pass
+        if current_index >= len(STOCKS):
+            current_index = 0
+
+        symbol = STOCKS[current_index]
+        print(f"🎯 本次輪詢目標: {MARKET} - {symbol} (索引 {current_index})")
+
+        # 处理这只股票
+        process_symbol(symbol, sheet)
+
+        # 更新索引并写入文件
+        next_index = (current_index + 1) % len(STOCKS)
+        with open(INDEX_FILE, "w") as f:
+            f.write(str(next_index))
+        print(f"📝 索引已更新為 {next_index}")
+
+    else:
+        # 兼容模式：全量扫描（手动触发时）
+        print("📋 未指定市場，執行全量掃描...")
+        for symbol in STOCKS_HK + STOCKS_US:
+            process_symbol(symbol, sheet)
 
 if __name__ == "__main__":
     main()
