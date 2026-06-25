@@ -520,7 +520,7 @@ def analyze_with_deepseek(hsi_data, spacetime, breadth, breadth_signal, tnx_val,
 # ==================== Telegram 推送 ====================
 async def send_telegram(text):
     print("📤 發送 Telegram...")
-    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='HTML')
         print("✅ HTML 格式發送成功")
