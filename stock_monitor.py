@@ -16,6 +16,28 @@ try:
 except Exception as e:
     print(f"❌ 讀取 stocks.txt 失敗: {e}")
     STOCKS = []
+def get_and_update_next_index(total_stocks):
+    INDEX_FILE = "current_index.txt"
+    # 1. 讀取上一次排隊到第幾隻
+    if os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE, "r") as f:
+            try:
+                current_index = int(f.read().strip())
+            except ValueError:
+                current_index = 0
+    else:
+        current_index = 0
+
+    # 如果索引超出範圍，重設為 0
+    if current_index >= total_stocks:
+        current_index = 0
+        
+    # 2. 計算下一次的索引，並寫回紀錄檔
+    next_index = (current_index + 1) % total_stocks
+    with open(INDEX_FILE, "w") as f:
+        f.write(str(next_index))
+        
+    return current_index
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
@@ -584,18 +606,30 @@ def force_analyze(symbol):
 # ==================== 主流程 ====================
 def main():
     check_telegram_commands()
-
+    
     sheet = init_gsheet()
-    for symbol in STOCKS:
-        try:
-            hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
-            if hist is None:
-                continue
-
-            initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
-            if not initial.get("alert"):
-                continue
-
+    
+    if not STOCKS:
+        print("❌ 沒有找到股票名單")
+        return
+        
+    # 💡 核心修改：利用排隊函數，獲取本次輪候應該掃描的股票
+    current_index = get_and_update_next_index(len(STOCKS))
+    symbol = STOCKS[current_index]
+    
+    print(f"\n🚀 [輪候系統啟動] 總監控股票數: {len(STOCKS)} 隻")
+    print(f"🎯 本次排隊輪到第 {current_index + 1} 隻股票: {symbol}")
+    
+    try:
+        hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
+        if hist is None:
+            print(f"⚠️ {symbol} 獲取不到數據，跳過本次分析。")
+            return
+            
+        initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
+        if not initial.get("alert"):
+            print(f"📉 {symbol} 未達異動標準，結束本次分析。")
+            return
             confidence = initial.get("confidence", 50)
             gemini_vision = None
 
