@@ -26,7 +26,7 @@ from matplotlib.gridspec import GridSpec
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # 讀取環境變量 (Secrets)
-TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 FRED_API_KEY = os.getenv('FRED_API_KEY')
