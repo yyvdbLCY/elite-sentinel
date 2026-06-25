@@ -11,3 +11,5 @@ requests
 beautifulsoup4
 akshare
 fredapi
+pandas
+matplotlib
