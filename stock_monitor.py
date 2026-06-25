@@ -91,17 +91,109 @@ def get_recent_data(symbol):
     return hist, vol_ratio, turnover, open_hour_ratio
 
 def generate_chart_b64(symbol, hist):
+    import io
+    import base64
     import warnings
     import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    import pandas as pd
+    import numpy as np
+
     matplotlib.rcParams['font.family'] = 'sans-serif'
     matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica', 'sans-serif']
+
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='.*findfont.*')
         warnings.filterwarnings('ignore', message='.*Font.*not found.*')
+
+        data = hist.tail(80).copy()
+        if len(data) < 20:
+            import mplfinance as mpf
+            buf = io.BytesIO()
+            savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
+            mpf.plot(data, type='candle', style='charles',
+                     volume=True, figsize=(10,6), savefig=savefig_config)
+            buf.seek(0)
+            return base64.b64encode(buf.read()).decode()
+
+        # MACD
+        exp12 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp26 = data['Close'].ewm(span=26, adjust=False).mean()
+        macd_line = exp12 - exp26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - signal_line
+
+        # RSI
+        delta = data['Close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        # 布局
+        fig = plt.figure(figsize=(10, 8), dpi=100)
+        gs = GridSpec(4, 1, height_ratios=[4, 1, 1, 1], hspace=0.05)
+
+        # 主图：K线 + 三条均线
+        ax1 = fig.add_subplot(gs[0])
+        colors = ['green' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'red' for i in range(len(data))]
+        width = 0.6
+        for i in range(len(data)):
+            ax1.plot([i, i], [data['Low'].iloc[i], data['High'].iloc[i]], color=colors[i], linewidth=1)
+            ax1.plot([i - width/2, i + width/2], [data['Open'].iloc[i], data['Open'].iloc[i]], color=colors[i], linewidth=4)
+            ax1.plot([i - width/2, i + width/2], [data['Close'].iloc[i], data['Close'].iloc[i]], color=colors[i], linewidth=4)
+
+        # 均线：MA10, MA20, MA50
+        ma10 = data['Close'].rolling(window=10).mean()
+        ma20 = data['Close'].rolling(window=20).mean()
+        ma50 = data['Close'].rolling(window=50).mean()
+        ax1.plot(range(len(data)), ma10, color='lime', linewidth=1, label='MA10')
+        ax1.plot(range(len(data)), ma20, color='orange', linewidth=1, label='MA20')
+        ax1.plot(range(len(data)), ma50, color='blue', linewidth=1, label='MA50')
+        ax1.legend(loc='upper left', fontsize=8)
+        ax1.set_xticks(range(0, len(data), max(1, len(data)//6)))
+        ax1.set_xticklabels([data.index[i].strftime('%m/%d %H:%M') for i in range(0, len(data), max(1, len(data)//6))], rotation=30, fontsize=7)
+        ax1.set_ylabel('Price', fontsize=8)
+        ax1.grid(True, alpha=0.3)
+
+        # 成交量
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        colors_vol = ['green' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'red' for i in range(len(data))]
+        ax2.bar(range(len(data)), data['Volume'], color=colors_vol, alpha=0.7)
+        ax2.set_ylabel('Volume', fontsize=8)
+        ax2.grid(True, alpha=0.3)
+        plt.setp(ax2.get_xticklabels(), visible=False)
+
+        # MACD
+        ax3 = fig.add_subplot(gs[2], sharex=ax1)
+        ax3.plot(range(len(data)), macd_line, color='blue', linewidth=1, label='MACD')
+        ax3.plot(range(len(data)), signal_line, color='red', linewidth=1, label='Signal')
+        ax3.bar(range(len(data)), macd_hist, color=['green' if v >= 0 else 'red' for v in macd_hist], alpha=0.5)
+        ax3.axhline(y=0, color='gray', linewidth=0.5)
+        ax3.legend(loc='upper left', fontsize=7)
+        ax3.set_ylabel('MACD', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+        plt.setp(ax3.get_xticklabels(), visible=False)
+
+        # RSI
+        ax4 = fig.add_subplot(gs[3], sharex=ax1)
+        ax4.plot(range(len(data)), rsi, color='purple', linewidth=1, label='RSI(14)')
+        ax4.axhline(y=70, color='red', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax4.axhline(y=30, color='green', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax4.set_ylim(0, 100)
+        ax4.set_ylabel('RSI', fontsize=8)
+        ax4.legend(loc='upper left', fontsize=7)
+        ax4.grid(True, alpha=0.3)
+        ax4.set_xticks(range(0, len(data), max(1, len(data)//6)))
+        ax4.set_xticklabels([data.index[i].strftime('%m/%d %H:%M') for i in range(0, len(data), max(1, len(data)//6))], rotation=30, fontsize=7)
+
+        fig.tight_layout()
         buf = io.BytesIO()
-        savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
-        mpf.plot(hist.tail(50), type='candle', style='charles',
-                 volume=True, figsize=(8,4), savefig=savefig_config)
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode()
 
