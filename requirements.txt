@@ -9,3 +9,4 @@ oauth2client
 python-telegram-bot
 requests
 beautifulsoup4
+akshare
