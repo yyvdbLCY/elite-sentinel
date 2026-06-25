@@ -613,7 +613,6 @@ def main():
         print("❌ 沒有找到股票名單")
         return
         
-    # 💡 核心修改：利用排隊函數，獲取本次輪候應該掃描的股票
     current_index = get_and_update_next_index(len(STOCKS))
     symbol = STOCKS[current_index]
     
@@ -627,43 +626,47 @@ def main():
             return
             
         initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
+        
+        # 修正重點：若無異動，直接結束，無需執行後續邏輯
         if not initial.get("alert"):
             print(f"📉 {symbol} 未達異動標準，結束本次分析。")
             return
-            confidence = initial.get("confidence", 50)
-            gemini_vision = None
 
-            # 🟢 视觉分析触发门槛提升至 80
-            if (gemini_client or HF_TOKEN) and confidence >= 70:
-                if not should_skip_gemini(symbol, hist):
-                    try:
-                        img_b64 = generate_chart_b64(symbol, hist)
-                        trend_desc = initial.get("trend_summary", "")
-                        gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
-                        if gemini_vision:
-                            LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
-                    except Exception as e:
-                        print(f"视觉分析流程异常: {e}")
-                else:
-                    print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
+        # 只有當 alert 為 True 時，才會執行以下分析
+        confidence = initial.get("confidence", 50)
+        gemini_vision = None
 
-            final = deepseek_debate(symbol, initial, gemini_vision)
-
-            news = search_news(symbol)
-            sentiment = deepseek_sentiment(symbol, news)
-
-            conf_val = final.get("confidence", 50)
-            if conf_val >= 80:
-                conf_tag = "🟢強信號"
-            elif conf_val >= 50:
-                conf_tag = "🟡弱信號（未經視覺驗證）"
+        # 🟢 视觉分析触发门槛提升至 70
+        if (gemini_client or HF_TOKEN) and confidence >= 70:
+            if not should_skip_gemini(symbol, hist):
+                try:
+                    img_b64 = generate_chart_b64(symbol, hist)
+                    trend_desc = initial.get("trend_summary", "")
+                    gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
+                    if gemini_vision:
+                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                except Exception as e:
+                    print(f"视觉分析流程异常: {e}")
             else:
-                conf_tag = "🔴微弱信號"
+                print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
 
-            action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
-            base_price = hist['Close'].iloc[-1]
+        final = deepseek_debate(symbol, initial, gemini_vision)
 
-            message = f"""
+        news = search_news(symbol)
+        sentiment = deepseek_sentiment(symbol, news)
+
+        conf_val = final.get("confidence", 50)
+        if conf_val >= 80:
+            conf_tag = "🟢強信號"
+        elif conf_val >= 50:
+            conf_tag = "🟡弱信號（未經視覺驗證）"
+        else:
+            conf_tag = "🔴微弱信號"
+
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+        base_price = hist['Close'].iloc[-1]
+
+        message = f"""
 🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
 📊 *訊號拆解*
@@ -681,12 +684,12 @@ def main():
 
 🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
-            send_telegram(message.strip())
-            append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
-            time.sleep(1)
+        send_telegram(message.strip())
+        append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
+        time.sleep(1)
 
-        except Exception as e:
-            print(f"处理 {symbol} 时发生错误: {e}")
+    except Exception as e:
+        print(f"處理 {symbol} 時發生錯誤: {e}")
 
 if __name__ == "__main__":
     main()
