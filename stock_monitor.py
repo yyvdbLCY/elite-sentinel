@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 print("🚀 精銳哨兵正在啟動...")
 
-# ==================== 配置 ====================
+# ------- 配置與初始化 -------
 def load_stock_list(filepath):
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -25,11 +25,11 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-MARKET = os.environ.get("MARKET", "").upper()   # 新增：由外部傳入 HK 或 US
+MARKET = os.environ.get("MARKET", "").upper()   # 由外部傳入 HK 或 US
 
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
-# Gemini 客户端
+# ------- Gemini 客戶端初始化 -------
 gemini_client = None
 if GEMINI_KEY:
     try:
@@ -40,18 +40,18 @@ if GEMINI_KEY:
     except Exception as e:
         print(f"⚠️ Gemini 初始化失敗: {e}")
 
-# Hugging Face 视觉模型
+# ------- Hugging Face 視覺模型配置 -------
 HF_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_VISION_MODEL}"
 
-# 状态记录
+# ------- 狀態記錄 -------
 LAST_GEMINI_ANALYSIS = {}
 LAST_GEMINI_CALL_TIME = 0
 GEMINI_CALL_LOG = []
 GEMINI_PER_RUN_LIMIT = 3
 GEMINI_RUN_CALLS = 0
 
-# ==================== 工具函数 (保持不变) ====================
+# ------- 工具函數：數據獲取 -------
 def get_recent_data(symbol):
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
@@ -90,6 +90,7 @@ def get_recent_data(symbol):
         pass
     return hist, vol_ratio, turnover, open_hour_ratio
 
+# ------- 工具函數：K線圖生成 -------
 def generate_chart_b64(symbol, hist):
     import io
     import base64
@@ -197,6 +198,7 @@ def generate_chart_b64(symbol, hist):
         buf.seek(0)
         return base64.b64encode(buf.read()).decode()
 
+# ------- 視覺分析輔助函數 -------
 def should_skip_gemini(symbol, hist):
     if symbol not in LAST_GEMINI_ANALYSIS:
         return False
@@ -208,6 +210,7 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
+# ------- DeepSeek 初判引擎 -------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     extra_info = ""
@@ -263,7 +266,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     )
     return json.loads(resp.choices[0].message.content)
 
-# ---------- 视觉分析相关函数保持不变 ----------
+# ------- Gemini 視覺分析引擎 -------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作為首席宏觀分析師，嚴格審視以下視覺信息，並全程使用繁體中文回答。"
     if trend_summary:
@@ -276,6 +279,7 @@ def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-
     )
     return resp.text
 
+# ------- 視覺分析配額與回退機制 -------
 def can_call_gemini():
     global GEMINI_RUN_CALLS
     if GEMINI_RUN_CALLS >= GEMINI_PER_RUN_LIMIT:
@@ -360,7 +364,7 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
         print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
     return None
 
-# ---------- 最终辩论 ----------
+# ------- 最終辯論與交易計劃生成 -------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
@@ -425,6 +429,7 @@ C路徑（橫盤）：若在79.30-80.50震盪，建議持有最多3個交易日�
     )
     return json.loads(resp.choices[0].message.content)
 
+# ------- 新聞情緒分析 -------
 def search_news(symbol):
     url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
     feed = feedparser.parse(url)
@@ -442,6 +447,7 @@ def deepseek_sentiment(symbol, news_items):
     )
     return resp.choices[0].message.content
 
+# ------- Telegram 消息發送 -------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
@@ -450,6 +456,7 @@ def send_telegram(text):
         safe = text.replace("*", "").replace("_", "").replace("`", "")
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe})
 
+# ------- Google Sheets 記錄 -------
 def init_gsheet():
     if 'GDRIVE_CREDENTIALS' not in os.environ:
         return None
@@ -477,7 +484,7 @@ def append_alert(sheet, symbol, confidence, suggestion, base_price):
     except Exception as e:
         print(f"写入 Sheets 失败: {e}")
 
-# ==================== Telegram 指令處理 ====================
+# ------- Telegram 指令處理（/analyze） -------
 def check_telegram_commands():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     offset_file = "last_update_id.txt"
@@ -517,6 +524,7 @@ def check_telegram_commands():
     except Exception as e:
         print(f"檢查 Telegram 指令時發生錯誤: {e}")
 
+# ------- 強制分析函數 -------
 def force_analyze(symbol):
     try:
         hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
@@ -578,7 +586,7 @@ def force_analyze(symbol):
     except Exception as e:
         send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
 
-# ==================== 个股处理函数（供轮询和全量扫描调用） ====================
+# ------- 個股處理流程（供輪詢與全量掃描調用） -------
 def process_symbol(symbol, sheet):
     try:
         hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
@@ -646,7 +654,7 @@ def process_symbol(symbol, sheet):
     except Exception as e:
         print(f"处理 {symbol} 时发生错误: {e}")
 
-# ==================== 主流程 ====================
+# ------- 主程序入口 -------
 def main():
     # 1. 检查 Telegram 指令
     check_telegram_commands()
