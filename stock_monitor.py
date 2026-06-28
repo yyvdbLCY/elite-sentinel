@@ -22,10 +22,10 @@ print(f"📋 港股 {len(STOCKS_HK)} 隻 | 美股 {len(STOCKS_US)} 隻")
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN")
+ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY")  # 智譜備用視覺引擎
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-MARKET = os.environ.get("MARKET", "").upper()   # 由外部傳入 HK 或 US
+MARKET = os.environ.get("MARKET", "").upper()
 
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
@@ -40,9 +40,9 @@ if GEMINI_KEY:
     except Exception as e:
         print(f"⚠️ Gemini 初始化失敗: {e}")
 
-# ------- Hugging Face 視覺模型配置 -------
-HF_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_VISION_MODEL}"
+# ------- 智譜視覺模型配置 -------
+ZHIPU_VISION_MODEL = "glm-4.6v-flash"
+ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
 # ------- 狀態記錄 -------
 LAST_GEMINI_ANALYSIS = {}
@@ -320,48 +320,58 @@ def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
             print(f"Gemini 视觉调用失败: {e}")
             return None
 
-def hf_vision_analysis(img_b64, symbol):
-    if not HF_TOKEN:
+# ------- 智譜視覺分析（備用引擎） -------
+def zhipu_vision_analysis(img_b64, symbol):
+    if not ZHIPU_API_KEY:
         return None
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    headers = {
+        "Authorization": f"Bearer {ZHIPU_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "inputs": f"請分析這張 {symbol} 的 K 線圖，觀察形態、均線、MACD，指出假突破或騙線訊號，並用繁體中文給出簡潔結論。",
-        "parameters": {"max_new_tokens": 200, "temperature": 0.1}
+        "model": ZHIPU_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": f"data:image/png;base64,{img_b64}"},
+                    {"type": "text", "text": f"請分析這張 {symbol} 的 K 線圖，觀察形態、均線、MACD，指出假突破或騙線訊號，並用繁體中文給出簡潔結論。"}
+                ]
+            }
+        ],
+        "max_tokens": 200,
+        "temperature": 0.1
     }
     try:
-        image_data = f"data:image/png;base64,{img_b64}"
-        messages = [{"role": "user", "content": [{"type": "image", "image": image_data}, {"type": "text", "text": payload["inputs"]}]}]
-        resp = requests.post(HF_API_URL, headers=headers, json={"inputs": messages, "parameters": payload["parameters"]}, timeout=20)
+        resp = requests.post(ZHIPU_API_URL, headers=headers, json=payload, timeout=20)
         if resp.status_code == 200:
             result = resp.json()
-            if isinstance(result, list) and len(result) > 0:
-                return result[0].get("generated_text", "")
-            elif isinstance(result, dict):
-                return result.get("generated_text", "")
+            return result["choices"][0]["message"]["content"].strip()
         else:
-            print(f"Hugging Face 请求失败 ({resp.status_code}): {resp.text}")
+            print(f"智譜 API 請求失敗 ({resp.status_code}): {resp.text}")
     except Exception as e:
-        print(f"Hugging Face 调用异常: {e}")
+        print(f"智譜視覺調用異常: {e}")
     return None
 
+# ------- 視覺分析完整回退鏈（Gemini → 智譜） -------
 def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
     if gemini_client:
         result = call_gemini_with_fallback(img_b64, symbol, trend_summary)
         if result:
             return result
-        print("Gemini 系列失败，尝试 Hugging Face 备选引擎...")
+        print("Gemini 系列失败，尝试智譜备用引擎...")
     else:
-        print("Gemini 未配置，直接尝试 Hugging Face 视觉引擎...")
-    if HF_TOKEN:
-        print("正在调用 Hugging Face 视觉模型...")
-        result = hf_vision_analysis(img_b64, symbol)
+        print("Gemini 未配置，直接尝试智譜视觉引擎...")
+    if ZHIPU_API_KEY:
+        print("正在调用智譜视觉模型...")
+        result = zhipu_vision_analysis(img_b64, symbol)
         if result:
-            print("Hugging Face 视觉分析成功")
+            print("智譜视觉分析成功")
             return result
         else:
-            print("Hugging Face 视觉分析失败")
+            print("智譜视觉分析失败")
     else:
-        print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
+        print("未设置 ZHIPU_API_KEY，跳过备用视觉分析")
     return None
 
 # ------- 最終辯論與交易計劃生成 -------
@@ -535,7 +545,7 @@ def force_analyze(symbol):
         initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
 
         gemini_vision = None
-        if (gemini_client or HF_TOKEN) and initial.get("confidence", 0) >= 80:
+        if (gemini_client or ZHIPU_API_KEY) and initial.get("confidence", 0) >= 80:
             if not should_skip_gemini(symbol, hist):
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
@@ -600,7 +610,7 @@ def process_symbol(symbol, sheet):
         confidence = initial.get("confidence", 50)
         gemini_vision = None
 
-        if (gemini_client or HF_TOKEN) and confidence >= 70:
+        if (gemini_client or ZHIPU_API_KEY) and confidence >= 70:
             if not should_skip_gemini(symbol, hist):
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
