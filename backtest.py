@@ -29,19 +29,20 @@ print(f"📋 讀取到 {len(records)} 條預警記錄")
 def extract_numbers_from_suggestion(suggestion):
     """
     从建议文本中提取关键数字：入场价、止损位、目标位
-    支持多种格式，如：
-    - 建議在80.15附近買入，目標82.40，止損79.00
-    - 入場位80.15，止損79.00，目標82.40
+    增强版：支持更多格式
     """
     entry = None
     stop_loss = None
     target = None
 
-    # 入场价
+    # ---- 入场价 ----
     entry_patterns = [
-        r'(?:買入[價价]?|入場[價价]?|建議在|建議於)\s*([\d.]+)',
+        r'(?:買入[價价]?|入場[價价]?|建議在|建議於|入场|入场价)\s*[：:]*\s*([\d.]+)',
         r'(?:入場|買入)\s*[：:]\s*([\d.]+)',
         r'在\s*([\d.]+)\s*附近[買买]入',
+        r'现价\s*([\d.]+)\s*附近',
+        r'入場價\s*([\d.]+)',
+        r'入场\s*([\d.]+)',
     ]
     for pat in entry_patterns:
         match = re.search(pat, suggestion)
@@ -49,11 +50,13 @@ def extract_numbers_from_suggestion(suggestion):
             entry = float(match.group(1))
             break
 
-    # 止损
+    # ---- 止损 ----
     stop_patterns = [
-        r'(?:止損|止蚀|止蚀位|空間止損)[：:\s]*[跌破]?\s*([\d.]+)',
+        r'(?:止損|止蚀|止蚀位|空間止損|空间止损)[：:\s]*[跌破]?\s*([\d.]+)',
         r'止損[設设]?[在於]?\s*([\d.]+)',
         r'跌破\s*([\d.]+)\s*[離离]場',
+        r'止损位\s*([\d.]+)',
+        r'空間止損[價格]?\s*([\d.]+)',
     ]
     for pat in stop_patterns:
         match = re.search(pat, suggestion)
@@ -61,17 +64,26 @@ def extract_numbers_from_suggestion(suggestion):
             stop_loss = float(match.group(1))
             break
 
-    # 目标
+    # ---- 目标 ----
     target_patterns = [
-        r'(?:目標|目標位|獲利目標)[：:\s]*[看至]?\s*([\d.]+)',
+        r'(?:目標|目標位|獲利目標|第一目標|目标位)[：:\s]*[看至]?\s*([\d.]+)',
         r'目標[價价]?[設设]?[在於]?\s*([\d.]+)',
         r'看至\s*([\d.]+)',
+        r'第一目標\s*([\d.]+)',
+        r'目标\s*([\d.]+)',
     ]
     for pat in target_patterns:
         match = re.search(pat, suggestion)
         if match:
             target = float(match.group(1))
             break
+
+    # 如果只提取到入场和止损，尝试从文本中找“目标”的另一种表述
+    if not target:
+        # 例如“目標看至 430” 等
+        extra = re.findall(r'目標看至\s*([\d.]+)', suggestion)
+        if extra:
+            target = float(extra[0])
 
     return entry, stop_loss, target
 
@@ -82,9 +94,9 @@ def backtest_signal(alert_time, symbol, suggestion):
     if not entry or not stop_loss or not target:
         return {"status": "數據不足", "reason": "無法提取入場/止損/目標"}
 
-    # 回看周期：港股 10 个交易小时（2天），美股 13 个交易小时（2天）
+    # 回看周期：港股 13 个交易小时（~2.5天），美股 13 个交易小时
     is_hk = symbol.endswith(".HK")
-    hours = 10 if is_hk else 13
+    hours = 13 if is_hk else 13
     end_time = alert_time + timedelta(hours=hours)
 
     try:
@@ -149,11 +161,11 @@ for record in records:
     result["alert_time"] = timestamp_str
     result["symbol"] = symbol
     result["confidence"] = confidence
-    result["suggestion"] = suggestion[:100]  # 截取前100字符
+    result["suggestion"] = suggestion[:100]
     results.append(result)
 
     print(f"  {symbol} @ {timestamp_str} → {result['status']}")
-    time.sleep(0.5)  # 避免 yfinance 请求过快
+    time.sleep(0.5)
 
 # ==================== 统计与报告 ====================
 total = len(results)
@@ -168,19 +180,17 @@ if win + lose > 0:
     win_rate = win / (win + lose) * 100
     print(f"  有效信號勝率: {win_rate:.1f}%")
 
-# ==================== 写入回测记录到新工作表 ====================
+# ==================== 写入回测记录（批量写入，避免429） ====================
 try:
     backtest_sheet = client.open("精锐哨兵预警记录").worksheet("回测记录")
 except:
     backtest_sheet = client.open("精锐哨兵预警记录").add_worksheet("回测记录", 1000, 10)
 
-# 写入表头
+# 准备所有行数据，一次性写入
 headers = ["预警时间", "股票", "状态", "入场", "止損", "目标", "触发时间", "触发价格", "置信度", "建议摘要"]
-backtest_sheet.insert_row(headers, 1)
-
-# 写入数据
+rows = [headers]
 for r in results:
-    row = [
+    rows.append([
         r.get("alert_time", ""),
         r.get("symbol", ""),
         r.get("status", ""),
@@ -191,7 +201,9 @@ for r in results:
         r.get("trigger_price", ""),
         r.get("confidence", ""),
         r.get("suggestion", ""),
-    ]
-    backtest_sheet.insert_row(row, 2)  # 插入到第二行（表头下方）
+    ])
 
+# 清空工作表并批量写入
+backtest_sheet.clear()
+backtest_sheet.update(rows, "A1")  # 一次性写入，只有1次写请求
 print("✅ 回测结果已写入 Google Sheets「回测记录」工作表")
