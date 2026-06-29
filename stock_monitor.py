@@ -8,24 +8,28 @@ from datetime import datetime, timedelta
 
 print("🚀 精銳哨兵正在啟動...")
 
-# ==================== 配置 ====================
-try:
-    with open("stocks.txt", "r", encoding="utf-8") as f:
-        STOCKS = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    print(f"📋 已載入 {len(STOCKS)} 隻監控標的")
-except Exception as e:
-    print(f"❌ 讀取 stocks.txt 失敗: {e}")
-    STOCKS = []
+# ------- 配置與初始化 -------
+def load_stock_list(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    except Exception:
+        return []
+
+STOCKS_HK = load_stock_list("stocks_hk.txt")
+STOCKS_US = load_stock_list("stocks_us.txt")
+print(f"📋 港股 {len(STOCKS_HK)} 隻 | 美股 {len(STOCKS_US)} 隻")
 
 DEEPSEEK_KEY = os.environ["DEEPSEEK_API_KEY"]
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-HF_TOKEN = os.environ.get("HF_TOKEN")
+ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY")  # 智譜備用視覺引擎
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+MARKET = os.environ.get("MARKET", "").upper()
 
 deepseek = OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
 
-# Gemini 客户端
+# ------- Gemini 客戶端初始化 -------
 gemini_client = None
 if GEMINI_KEY:
     try:
@@ -36,18 +40,18 @@ if GEMINI_KEY:
     except Exception as e:
         print(f"⚠️ Gemini 初始化失敗: {e}")
 
-# Hugging Face 视觉模型
-HF_VISION_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
-HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_VISION_MODEL}"
+# ------- 智譜視覺模型配置 -------
+ZHIPU_VISION_MODEL = "glm-4.6v-flash"
+ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
-# 状态记录
+# ------- 狀態記錄 -------
 LAST_GEMINI_ANALYSIS = {}
 LAST_GEMINI_CALL_TIME = 0
 GEMINI_CALL_LOG = []
 GEMINI_PER_RUN_LIMIT = 3
 GEMINI_RUN_CALLS = 0
 
-# ==================== 工具函数 ====================
+# ------- 工具函數：數據獲取 -------
 def get_recent_data(symbol):
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
@@ -86,21 +90,115 @@ def get_recent_data(symbol):
         pass
     return hist, vol_ratio, turnover, open_hour_ratio
 
+# ------- 工具函數：K線圖生成 -------
 def generate_chart_b64(symbol, hist):
+    import io
+    import base64
     import warnings
     import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    import pandas as pd
+    import numpy as np
+
     matplotlib.rcParams['font.family'] = 'sans-serif'
     matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica', 'sans-serif']
+
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', message='.*findfont.*')
         warnings.filterwarnings('ignore', message='.*Font.*not found.*')
+
+        data = hist.tail(80).copy()
+        if len(data) < 20:
+            import mplfinance as mpf
+            buf = io.BytesIO()
+            savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
+            mpf.plot(data, type='candle', style='charles',
+                     volume=True, figsize=(10,6), savefig=savefig_config)
+            buf.seek(0)
+            return base64.b64encode(buf.read()).decode()
+
+        # MACD
+        exp12 = data['Close'].ewm(span=12, adjust=False).mean()
+        exp26 = data['Close'].ewm(span=26, adjust=False).mean()
+        macd_line = exp12 - exp26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - signal_line
+
+        # RSI
+        delta = data['Close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        # 布局
+        fig = plt.figure(figsize=(10, 8), dpi=100)
+        gs = GridSpec(4, 1, height_ratios=[4, 1, 1, 1], hspace=0.05)
+
+        # 主图：K线 + 三条均线
+        ax1 = fig.add_subplot(gs[0])
+        colors = ['green' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'red' for i in range(len(data))]
+        width = 0.6
+        for i in range(len(data)):
+            ax1.plot([i, i], [data['Low'].iloc[i], data['High'].iloc[i]], color=colors[i], linewidth=1)
+            ax1.plot([i - width/2, i + width/2], [data['Open'].iloc[i], data['Open'].iloc[i]], color=colors[i], linewidth=4)
+            ax1.plot([i - width/2, i + width/2], [data['Close'].iloc[i], data['Close'].iloc[i]], color=colors[i], linewidth=4)
+
+        # 均线：MA10, MA20, MA50
+        ma10 = data['Close'].rolling(window=10).mean()
+        ma20 = data['Close'].rolling(window=20).mean()
+        ma50 = data['Close'].rolling(window=50).mean()
+        ax1.plot(range(len(data)), ma10, color='lime', linewidth=1, label='MA10')
+        ax1.plot(range(len(data)), ma20, color='orange', linewidth=1, label='MA20')
+        ax1.plot(range(len(data)), ma50, color='blue', linewidth=1, label='MA50')
+        ax1.legend(loc='upper left', fontsize=8)
+        ax1.set_xticks(range(0, len(data), max(1, len(data)//6)))
+        ax1.set_xticklabels([data.index[i].strftime('%m/%d %H:%M') for i in range(0, len(data), max(1, len(data)//6))], rotation=30, fontsize=7)
+        ax1.set_ylabel('Price', fontsize=8)
+        ax1.grid(True, alpha=0.3)
+
+        # 成交量
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        colors_vol = ['green' if data['Close'].iloc[i] >= data['Open'].iloc[i] else 'red' for i in range(len(data))]
+        ax2.bar(range(len(data)), data['Volume'], color=colors_vol, alpha=0.7)
+        ax2.set_ylabel('Volume', fontsize=8)
+        ax2.grid(True, alpha=0.3)
+        plt.setp(ax2.get_xticklabels(), visible=False)
+
+        # MACD
+        ax3 = fig.add_subplot(gs[2], sharex=ax1)
+        ax3.plot(range(len(data)), macd_line, color='blue', linewidth=1, label='MACD')
+        ax3.plot(range(len(data)), signal_line, color='red', linewidth=1, label='Signal')
+        ax3.bar(range(len(data)), macd_hist, color=['green' if v >= 0 else 'red' for v in macd_hist], alpha=0.5)
+        ax3.axhline(y=0, color='gray', linewidth=0.5)
+        ax3.legend(loc='upper left', fontsize=7)
+        ax3.set_ylabel('MACD', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+        plt.setp(ax3.get_xticklabels(), visible=False)
+
+        # RSI
+        ax4 = fig.add_subplot(gs[3], sharex=ax1)
+        ax4.plot(range(len(data)), rsi, color='purple', linewidth=1, label='RSI(14)')
+        ax4.axhline(y=70, color='red', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax4.axhline(y=30, color='green', linestyle='--', linewidth=0.8, alpha=0.7)
+        ax4.set_ylim(0, 100)
+        ax4.set_ylabel('RSI', fontsize=8)
+        ax4.legend(loc='upper left', fontsize=7)
+        ax4.grid(True, alpha=0.3)
+        ax4.set_xticks(range(0, len(data), max(1, len(data)//6)))
+        ax4.set_xticklabels([data.index[i].strftime('%m/%d %H:%M') for i in range(0, len(data), max(1, len(data)//6))], rotation=30, fontsize=7)
+
+        fig.tight_layout()
         buf = io.BytesIO()
-        savefig_config = dict(fname=buf, dpi=80, format='png', bbox_inches='tight')
-        mpf.plot(hist.tail(50), type='candle', style='charles',
-                 volume=True, figsize=(8,4), savefig=savefig_config)
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode()
 
+# ------- 視覺分析輔助函數 -------
 def should_skip_gemini(symbol, hist):
     if symbol not in LAST_GEMINI_ANALYSIS:
         return False
@@ -112,7 +210,7 @@ def should_skip_gemini(symbol, hist):
             return True
     return False
 
-# ---------- 调整后的 DeepSeek 初判（放宽阈值 + 保护视觉额度）----------
+# ------- DeepSeek 初判引擎 -------
 def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
     extra_info = ""
@@ -124,7 +222,6 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     if force:
         hard_filter_block = "(用戶主動請求分析，忽略自動靜默閾值，但若以下硬指標未通過，請在 risk_factors 中註明，仍給出正常分析)"
     else:
-        # 🟢 放宽后的规则：量能门槛降至1.5，且不强制 false，改为降低置信度并标注
         hard_filter_block = """## 硬性過濾規則（放寬版）
 請先執行以下檢查，根據結果調整置信度，但不強制攔截（除非完全無異動）：
 1. 若成交量倍數 < 1.5，且未出現明確反轉形態（頭肩底、雙底、楔形突破、早晨之星、鑷底等），請將置信度降低 15-20 點，並在 reason 中註明「量能偏弱」；若出現反轉形態，可維持原置信度。
@@ -169,7 +266,7 @@ def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, op
     )
     return json.loads(resp.choices[0].message.content)
 
-# ---------- 视觉分析相关函数保持不变 ----------
+# ------- Gemini 視覺分析引擎 -------
 def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-flash'):
     base_prompt = "作為首席宏觀分析師，嚴格審視以下視覺信息，並全程使用繁體中文回答。"
     if trend_summary:
@@ -182,6 +279,7 @@ def gemini_vision_analysis(img_b64, symbol, trend_summary="", model='gemini-2.5-
     )
     return resp.text
 
+# ------- 視覺分析配額與回退機制 -------
 def can_call_gemini():
     global GEMINI_RUN_CALLS
     if GEMINI_RUN_CALLS >= GEMINI_PER_RUN_LIMIT:
@@ -222,51 +320,61 @@ def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
             print(f"Gemini 视觉调用失败: {e}")
             return None
 
-def hf_vision_analysis(img_b64, symbol):
-    if not HF_TOKEN:
+# ------- 智譜視覺分析（備用引擎） -------
+def zhipu_vision_analysis(img_b64, symbol):
+    if not ZHIPU_API_KEY:
         return None
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    headers = {
+        "Authorization": f"Bearer {ZHIPU_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "inputs": f"請分析這張 {symbol} 的 K 線圖，觀察形態、均線、MACD，指出假突破或騙線訊號，並用繁體中文給出簡潔結論。",
-        "parameters": {"max_new_tokens": 200, "temperature": 0.1}
+        "model": ZHIPU_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": f"data:image/png;base64,{img_b64}"},
+                    {"type": "text", "text": f"請分析這張 {symbol} 的 K 線圖，觀察形態、均線、MACD，指出假突破或騙線訊號，並用繁體中文給出簡潔結論。"}
+                ]
+            }
+        ],
+        "max_tokens": 200,
+        "temperature": 0.1
     }
     try:
-        image_data = f"data:image/png;base64,{img_b64}"
-        messages = [{"role": "user", "content": [{"type": "image", "image": image_data}, {"type": "text", "text": payload["inputs"]}]}]
-        resp = requests.post(HF_API_URL, headers=headers, json={"inputs": messages, "parameters": payload["parameters"]}, timeout=20)
+        resp = requests.post(ZHIPU_API_URL, headers=headers, json=payload, timeout=20)
         if resp.status_code == 200:
             result = resp.json()
-            if isinstance(result, list) and len(result) > 0:
-                return result[0].get("generated_text", "")
-            elif isinstance(result, dict):
-                return result.get("generated_text", "")
+            return result["choices"][0]["message"]["content"].strip()
         else:
-            print(f"Hugging Face 请求失败 ({resp.status_code}): {resp.text}")
+            print(f"智譜 API 請求失敗 ({resp.status_code}): {resp.text}")
     except Exception as e:
-        print(f"Hugging Face 调用异常: {e}")
+        print(f"智譜視覺調用異常: {e}")
     return None
 
+# ------- 視覺分析完整回退鏈（Gemini → 智譜） -------
 def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
     if gemini_client:
         result = call_gemini_with_fallback(img_b64, symbol, trend_summary)
         if result:
             return result
-        print("Gemini 系列失败，尝试 Hugging Face 备选引擎...")
+        print("Gemini 系列失败，尝试智譜备用引擎...")
     else:
-        print("Gemini 未配置，直接尝试 Hugging Face 视觉引擎...")
-    if HF_TOKEN:
-        print("正在调用 Hugging Face 视觉模型...")
-        result = hf_vision_analysis(img_b64, symbol)
+        print("Gemini 未配置，直接尝试智譜视觉引擎...")
+    if ZHIPU_API_KEY:
+        print("正在调用智譜视觉模型...")
+        result = zhipu_vision_analysis(img_b64, symbol)
         if result:
-            print("Hugging Face 视觉分析成功")
+            print("智譜视觉分析成功")
             return result
         else:
-            print("Hugging Face 视觉分析失败")
+            print("智譜视觉分析失败")
     else:
-        print("未设置 HF_TOKEN，跳过 Hugging Face 视觉分析")
+        print("未设置 ZHIPU_API_KEY，跳过备用视觉分析")
     return None
 
-# ---------- 最终辩论（无变化）----------
+# ------- 最終辯論與交易計劃生成 -------
 def deepseek_debate(symbol, initial_judge, gemini_vision):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
@@ -294,9 +402,10 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
 - 第一行：核心操作建議與方向（包括入場點、止損點、目標位、盈虧比結果，若低於 1:3 標註「博弈性價比低」）
 - 第二行：空間止損條件
 - 第三行：時間止損條件
-- 第四行：A路徑（達標）
-- 第五行：B路徑（失效）
-- 第六行：C路徑（橫盤）
+- 第四行：
+- 第五行：A路徑（達標）
+- 第六行：B路徑（失效）
+- 第七行：C路徑（橫盤）
 
 你之前對 {symbol} 的初步判斷是：
 {json.dumps(initial_judge, ensure_ascii=False)}
@@ -317,6 +426,7 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
 建議：基於純量價分析，建議在80.15附近買入，目標82.40，止損79.00，盈虧比1.96:1（低於3:1，博弈性價比低）
 空間止損：跌破79.00離場
 時間止損：若在80.00上方橫盤2個交易日無法拉回則失效
+
 A路徑（達標）：若站穩82.40，可加倉至84.00
 B路徑（失效）：若跌破79.00或時間止損觸發，訊號作廢
 C路徑（橫盤）：若在79.30-80.50震盪，建議持有最多3個交易日等待突破"
@@ -329,6 +439,7 @@ C路徑（橫盤）：若在79.30-80.50震盪，建議持有最多3個交易日�
     )
     return json.loads(resp.choices[0].message.content)
 
+# ------- 新聞情緒分析 -------
 def search_news(symbol):
     url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
     feed = feedparser.parse(url)
@@ -346,6 +457,7 @@ def deepseek_sentiment(symbol, news_items):
     )
     return resp.choices[0].message.content
 
+# ------- Telegram 消息發送 -------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"})
@@ -354,6 +466,7 @@ def send_telegram(text):
         safe = text.replace("*", "").replace("_", "").replace("`", "")
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe})
 
+# ------- Google Sheets 記錄 -------
 def init_gsheet():
     if 'GDRIVE_CREDENTIALS' not in os.environ:
         return None
@@ -381,7 +494,7 @@ def append_alert(sheet, symbol, confidence, suggestion, base_price):
     except Exception as e:
         print(f"写入 Sheets 失败: {e}")
 
-# ==================== Telegram 指令處理 ====================
+# ------- Telegram 指令處理（/analyze） -------
 def check_telegram_commands():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     offset_file = "last_update_id.txt"
@@ -421,6 +534,7 @@ def check_telegram_commands():
     except Exception as e:
         print(f"檢查 Telegram 指令時發生錯誤: {e}")
 
+# ------- 強制分析函數 -------
 def force_analyze(symbol):
     try:
         hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
@@ -428,12 +542,10 @@ def force_analyze(symbol):
             send_telegram(f"❌ 無法取得 {symbol} 的數據，請檢查代號是否正確。")
             return
 
-        # 強制初判（force=True）
         initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
 
-        # 尝试视觉分析
         gemini_vision = None
-        if (gemini_client or HF_TOKEN) and initial.get("confidence", 0) >= 80:
+        if (gemini_client or ZHIPU_API_KEY) and initial.get("confidence", 0) >= 80:
             if not should_skip_gemini(symbol, hist):
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
@@ -444,10 +556,8 @@ def force_analyze(symbol):
                 except Exception as e:
                     print(f"强制分析视觉异常: {e}")
 
-        # 最终辩论
         final = deepseek_debate(symbol, initial, gemini_vision)
 
-        # 新闻情绪
         news = search_news(symbol)
         sentiment = deepseek_sentiment(symbol, news)
 
@@ -462,7 +572,6 @@ def force_analyze(symbol):
         action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
         base_price = hist['Close'].iloc[-1]
 
-        # 构建与常规预警一致的消息格式
         message = f"""
 🚨 *【{symbol}】強制分析結果* | 置信度：{conf_val}% {conf_tag}
 
@@ -487,55 +596,50 @@ def force_analyze(symbol):
     except Exception as e:
         send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
 
-# ==================== 主流程 ====================
-def main():
-    check_telegram_commands()
+# ------- 個股處理流程（供輪詢與全量掃描調用） -------
+def process_symbol(symbol, sheet):
+    try:
+        hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
+        if hist is None:
+            return
 
-    sheet = init_gsheet()
-    for symbol in STOCKS:
-        try:
-            hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
-            if hist is None:
-                continue
+        initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
+        if not initial.get("alert"):
+            return
 
-            initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
-            if not initial.get("alert"):
-                continue
+        confidence = initial.get("confidence", 50)
+        gemini_vision = None
 
-            confidence = initial.get("confidence", 50)
-            gemini_vision = None
-
-            # 🟢 视觉分析触发门槛提升至 80
-            if (gemini_client or HF_TOKEN) and confidence >= 70:
-                if not should_skip_gemini(symbol, hist):
-                    try:
-                        img_b64 = generate_chart_b64(symbol, hist)
-                        trend_desc = initial.get("trend_summary", "")
-                        gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
-                        if gemini_vision:
-                            LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
-                    except Exception as e:
-                        print(f"视觉分析流程异常: {e}")
-                else:
-                    print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
-
-            final = deepseek_debate(symbol, initial, gemini_vision)
-
-            news = search_news(symbol)
-            sentiment = deepseek_sentiment(symbol, news)
-
-            conf_val = final.get("confidence", 50)
-            if conf_val >= 80:
-                conf_tag = "🟢強信號"
-            elif conf_val >= 50:
-                conf_tag = "🟡弱信號（未經視覺驗證）"
+        if (gemini_client or ZHIPU_API_KEY) and confidence >= 70:
+            if not should_skip_gemini(symbol, hist):
+                try:
+                    img_b64 = generate_chart_b64(symbol, hist)
+                    trend_desc = initial.get("trend_summary", "")
+                    gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
+                    if gemini_vision:
+                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                except Exception as e:
+                    print(f"视觉分析流程异常: {e}")
             else:
-                conf_tag = "🔴微弱信號"
+                print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
 
-            action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
-            base_price = hist['Close'].iloc[-1]
+        final = deepseek_debate(symbol, initial, gemini_vision)
 
-            message = f"""
+        news = search_news(symbol)
+        sentiment = deepseek_sentiment(symbol, news)
+
+        conf_val = final.get("confidence", 50)
+        if conf_val >= 80:
+            conf_tag = "🟢強信號"
+        elif conf_val >= 50:
+            conf_tag = "🟡弱信號（未經視覺驗證）"
+        else:
+            conf_tag = "🔴微弱信號"
+
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+        base_price = hist['Close'].iloc[-1]
+
+        message = f"""
 🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
 
 📊 *訊號拆解*
@@ -553,12 +657,63 @@ def main():
 
 🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
 """
-            send_telegram(message.strip())
-            append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
-            time.sleep(1)
+        send_telegram(message.strip())
+        append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
+        time.sleep(1)
 
-        except Exception as e:
-            print(f"处理 {symbol} 时发生错误: {e}")
+    except Exception as e:
+        print(f"处理 {symbol} 时发生错误: {e}")
+
+# ------- 主程序入口 -------
+def main():
+    # 1. 检查 Telegram 指令
+    check_telegram_commands()
+
+    # 2. 初始化 Google Sheets
+    sheet = init_gsheet()
+
+    # 3. 根据环境变量决定运行模式
+    if MARKET in ("HK", "US"):
+        # 轮询模式：一次只处理一只股票
+        if MARKET == "HK":
+            STOCKS = STOCKS_HK
+            INDEX_FILE = "current_index_hk.txt"
+        else:
+            STOCKS = STOCKS_US
+            INDEX_FILE = "current_index_us.txt"
+
+        if not STOCKS:
+            print(f"⚠️ {MARKET} 股票清單為空，結束運行。")
+            return
+
+        # 读取当前索引
+        current_index = 0
+        if os.path.exists(INDEX_FILE):
+            with open(INDEX_FILE, "r") as f:
+                try:
+                    current_index = int(f.read().strip())
+                except:
+                    pass
+        if current_index >= len(STOCKS):
+            current_index = 0
+
+        symbol = STOCKS[current_index]
+        print(f"🎯 本次輪詢目標: {MARKET} - {symbol} (索引 {current_index})")
+
+        # 处理这只股票
+        process_symbol(symbol, sheet)
+
+        # 更新索引并写入文件
+        next_index = (current_index + 1) % len(STOCKS)
+        with open(INDEX_FILE, "w") as f:
+            f.write(str(next_index))
+        print(f"📝 索引已更新為 {next_index}")
+
+    else:
+        # 兼容模式：全量扫描（手动触发时）
+        print("📋 未指定市場，執行全量掃描...")
+        for symbol in STOCKS_HK + STOCKS_US:
+            process_symbol(symbol, sheet)
 
 if __name__ == "__main__":
     main()
