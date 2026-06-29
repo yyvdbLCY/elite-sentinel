@@ -42,6 +42,7 @@ jobs:
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           MARKET: ${{ github.event.inputs.market }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python stock_monitor.py
 
       - name: Commit index and offset
