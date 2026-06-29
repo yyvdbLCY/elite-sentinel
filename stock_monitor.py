@@ -50,13 +50,14 @@ LAST_GEMINI_CALL_TIME = 0
 GEMINI_CALL_LOG = []
 GEMINI_PER_RUN_LIMIT = 3
 GEMINI_RUN_CALLS = 0
+LAST_GEMINI_ERROR = {}
 
 # ------- 工具函數：數據獲取 -------
 def get_recent_data(symbol):
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period="5d", interval="1h")
     if hist.empty:
-        return None, None, None, None
+        return None, None, None, None, None
     if len(hist) >= 21:
         avg_vol = hist['Volume'].iloc[-21:-1].mean()
         last_vol = hist['Volume'].iloc[-1]
@@ -65,7 +66,7 @@ def get_recent_data(symbol):
         vol_ratio = 1.0
     turnover = None
     try:
-        shares = ticker.info.get('sharesOutstanding')
+        shares = ticker.fast_info.get('shares') or ticker.info.get('sharesOutstanding')
         if shares and shares > 0:
             turnover = (hist['Volume'].iloc[-1] / shares) * 100
     except:
@@ -88,7 +89,21 @@ def get_recent_data(symbol):
                     open_hour_ratio = first_hour_vol / avg_first if avg_first > 0 else None
     except:
         pass
-    return hist, vol_ratio, turnover, open_hour_ratio
+    # 新增：獲取日線數據用於多時間框架過濾
+    daily_trend = None
+    try:
+        daily = ticker.history(period="3mo", interval="1d")
+        if not daily.empty and len(daily) >= 20:
+            daily_ma20 = daily['Close'].rolling(window=20).mean().iloc[-1]
+            daily_close = daily['Close'].iloc[-1]
+            daily_trend = {
+                'ma20': daily_ma20,
+                'close': daily_close,
+                'above_ma20': daily_close > daily_ma20,
+            }
+    except:
+        pass
+    return hist, vol_ratio, turnover, open_hour_ratio, daily_trend
 
 # ------- 工具函數：K線圖生成 -------
 def generate_chart_b64(symbol, hist):
@@ -199,65 +214,235 @@ def generate_chart_b64(symbol, hist):
         return base64.b64encode(buf.read()).decode()
 
 # ------- 視覺分析輔助函數 -------
-def should_skip_gemini(symbol, hist):
-    if symbol not in LAST_GEMINI_ANALYSIS:
-        return False
-    last_time, last_price = LAST_GEMINI_ANALYSIS[symbol]
-    current_price = hist['Close'].iloc[-1]
-    if time.time() - last_time < 1800:
-        if abs(current_price - last_price) / last_price < 0.01:
-            print(f"{symbol} 近期已分析且波動小，跳過視覺分析")
-            return True
-    return False
+def process_symbol(symbol, sheet):
+    try:
+        hist, vol_ratio, turnover, open_hour_ratio, daily_trend = get_recent_data(symbol)
+        if hist is None:
+            return
+
+        # ---- 第1步：Python硬性過濾（攔截無效信號，節省API額度）----
+        passed, filter_reason = hard_filter_signals(hist, vol_ratio, turnover)
+        if not passed:
+            print(f"⏭️ {symbol} 被硬性過濾：{filter_reason}")
+            return
+
+        # ---- 第2步：計算量化指標（形態、支撐壓力）----
+        patterns = detect_patterns(hist)
+        key_levels = calculate_key_levels(hist)
+
+        # ---- 第3步：DeepSeek初判（基於預計算指標）----
+        initial = deepseek_judge_alert(
+            symbol, hist, vol_ratio,
+            turnover=turnover,
+            open_hour_ratio=open_hour_ratio,
+            daily_trend=daily_trend,
+            patterns=patterns,
+            key_levels=key_levels
+        )
+
+        if not initial.get("alert"):
+            return
+
+        # ---- 第3.5步：多時間框架趨勢過濾（逆勢信號降級）----
+        is_counter_trend, mtf_reason = mtf_trend_filter(initial.get('action', ''), daily_trend)
+        if is_counter_trend:
+            current_conf = initial.get("confidence", 50)
+            initial["confidence"] = max(10, current_conf - 30)
+            initial["reason"] = f"{initial.get('reason', '')} | {mtf_reason}"
+            if initial["confidence"] < 50:
+                print(f"⏭️ {symbol} 逆勢信號置信度過低，跳過：{mtf_reason}")
+                return
+
+        confidence = initial.get("confidence", 50)
+
+        # ---- 第4步：新聞情緒分析（前置，供辯論使用）----
+        news = search_news(symbol)
+        sentiment = deepseek_sentiment(symbol, news)
+
+        # ---- 第5步：視覺分析（提高門檻至80，增加形態校驗）----
+        gemini_vision = None
+        if (gemini_client or ZHIPU_API_KEY) and confidence >= 80 and has_visual_worthy_patterns(patterns):
+            if not should_skip_gemini(symbol, hist):
+                try:
+                    img_b64 = generate_chart_b64(symbol, hist)
+                    trend_desc = initial.get("trend_summary", "")
+                    gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
+                    if gemini_vision:
+                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
+                except Exception as e:
+                    print(f"視覺分析流程異常: {e}")
+            else:
+                print(f"跳過 {symbol} 的視覺分析（近期已分析且波動小）")
+
+        # ---- 第6步：DeepSeek最終辯論（結合新聞情緒與視覺分析）----
+        final = deepseek_debate(symbol, initial, gemini_vision, sentiment)
+
+        # ---- 第7步：Python盈虧比複核（低於1.5則降級）----
+        final = check_risk_reward(final, key_levels)
+
+        # 視覺形態補充：若視覺未提供或置信度不足，顯示純量價說明或視覺錯誤原因
+        final.setdefault('signal_breakdown', {})
+        vis_pattern = final['signal_breakdown'].get('visual_pattern', '')
+        if not vis_pattern or vis_pattern.strip() == '':
+            if final.get('confidence', 0) < 80:
+                if symbol in LAST_GEMINI_ERROR:
+                    final['signal_breakdown']['visual_pattern'] = f"視覺模型失敗：{LAST_GEMINI_ERROR[symbol]}，因此基於純量價分析"
+                else:
+                    final['signal_breakdown']['visual_pattern'] = "由於置信度不足基於純量價分析"
+
+        # ---- 第8步：發送預警----
+        conf_val = final.get("confidence", 50)
+        if conf_val >= 80:
+            conf_tag = "🟢強信號"
+        elif conf_val >= 50:
+            conf_tag = "🟡弱信號（未經視覺驗證）"
+        else:
+            conf_tag = "🔴微弱信號"
+
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final.get("action"), "⚪")
+        base_price = hist['Close'].iloc[-1]
+
+        message = f"""
+🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag} 📊 *訊號拆解*  ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}  ▪ 量能確認：{final['signal_breakdown'].get('volume_confirmation','')}  ▪ 圖形形態：{final['signal_breakdown'].get('visual_pattern','')} ⚠️ *風險提示*  {chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))} 📰 *新聞情緒*：{sentiment} {action_emoji} *建議*：{final.get('suggestion','')} 🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`"""
+        send_telegram(message.strip())
+        append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"處理 {symbol} 時發生錯誤: {e}")
+    # 吞沒形態
+    if len(c) >= 2:
+        if c[-1] > o[-1] and c[-2] < o[-2] and c[-1] >= o[-2] and o[-1] <= c[-2]:
+            patterns.append("看漲吞沒")
+        elif c[-1] < o[-1] and c[-2] > o[-2] and c[-1] <= o[-2] and o[-1] >= c[-2]:
+            patterns.append("看跌吞沒")
+    # 十字星
+    if len(c) >= 1:
+        body = abs(c[-1] - o[-1])
+        range_ = h[-1] - l[-1]
+        if range_ > 0 and body / range_ < 0.1:
+            patterns.append("十字星")
+    # 長上影線 / 長下影線
+    if len(c) >= 1:
+        body = abs(c[-1] - o[-1])
+        if body > 0:
+            upper_shadow = h[-1] - max(c[-1], o[-1])
+            lower_shadow = min(c[-1], o[-1]) - l[-1]
+            if upper_shadow / body > 2:
+                patterns.append("長上影線")
+            if lower_shadow / body > 2:
+                patterns.append("長下影線")
+    # 早晨之星 / 黃昏之星
+    if len(c) >= 3:
+        body1 = abs(c[-3] - o[-3])
+        body2 = abs(c[-2] - o[-2])
+        if body1 > 0:
+            if c[-3] < o[-3] and body2 < body1 * 0.5 and c[-1] > o[-1] and c[-1] > (o[-3] + c[-3]) / 2:
+                patterns.append("早晨之星")
+            if c[-3] > o[-3] and body2 < body1 * 0.5 and c[-1] < o[-1] and c[-1] < (o[-3] + c[-3]) / 2:
+                patterns.append("黃昏之星")
+    # MACD背離檢測
+    if len(hist) >= 35:
+        exp12 = hist['Close'].ewm(span=12, adjust=False).mean()
+        exp26 = hist['Close'].ewm(span=26, adjust=False).mean()
+        macd_line = exp12 - exp26
+        lookback = min(15, len(hist) - 1)
+        price_now = hist['High'].iloc[-1]
+        price_past = hist['High'].iloc[-lookback]
+        macd_now = macd_line.iloc[-1]
+        macd_past = macd_line.iloc[-lookback]
+        if price_now > price_past and macd_now < macd_past:
+            patterns.append("MACD頂背離")
+        elif price_now < price_past and macd_now > macd_past:
+            patterns.append("MACD底背離")
+    return patterns if patterns else ["無明顯形態"]
+
+# ------- 新增：支撐壓力計算 -------
+def calculate_key_levels(hist):
+    """計算關鍵支撐位和壓力位"""
+    if len(hist) < 20:
+        return None
+    recent = hist.tail(20)
+    resistance = recent['High'].max()
+    support = recent['Low'].min()
+    current = hist['Close'].iloc[-1]
+    return {
+        'resistance': resistance,
+        'support': support,
+        'current_price': current,
+        'dist_to_resistance': (resistance - current) / current * 100 if current > 0 else 0,
+        'dist_to_support': (current - support) / current * 100 if current > 0 else 0,
+    }
+
+# ------- 新增：盈虧比複核 -------
+def check_risk_reward(final, key_levels):
+    """複核盈虧比，若低於1.5則降級置信度"""
+    if not key_levels or not final.get('action'):
+        return final
+    current = key_levels['current_price']
+    support = key_levels['support']
+    resistance = key_levels['resistance']
+    if final['action'] == 'BUY':
+        potential_loss = current - support
+        potential_gain = resistance - current
+        if potential_loss > 0 and potential_gain > 0:
+            rr = potential_gain / potential_loss
+            if rr < 1.5:
+                final['confidence'] = min(final.get('confidence', 50), 40)
+                final['suggestion'] = f"⚠️ 盈虧比僅{rr:.1f}:1（低於1.5:1標準），信號已降級\n" + final.get('suggestion', '')
+    elif final['action'] == 'SELL':
+        potential_loss = resistance - current
+        potential_gain = current - support
+        if potential_loss > 0 and potential_gain > 0:
+            rr = potential_gain / potential_loss
+            if rr < 1.5:
+                final['confidence'] = min(final.get('confidence', 50), 40)
+                final['suggestion'] = f"⚠️ 盈虧比僅{rr:.1f}:1（低於1.5:1標準），信號已降級\n" + final.get('suggestion', '')
+    return final
+
+# ------- 新增：多時間框架趨勢過濾 -------
+def mtf_trend_filter(action, daily_trend):
+    """多時間框架過濾：1h信號與日線趨勢相反時返回降級標記"""
+    if not daily_trend:
+        return False, "無日線數據，跳過MTF過濾"
+    if action == 'BUY' and not daily_trend['above_ma20']:
+        return True, f"逆勢信號（1h看多但日線在MA20下方={daily_trend['ma20']:.2f}）"
+    if action == 'SELL' and daily_trend['above_ma20']:
+        return True, f"逆勢信號（1h看空但日線在MA20上方={daily_trend['ma20']:.2f}）"
+    return False, "順勢信號"
+
+# ------- 新增：判斷是否有值得視覺分析的形態 -------
+def has_visual_worthy_patterns(patterns):
+    """只有出現關鍵形態才調用視覺模型，節省API額度"""
+    key_patterns = {"看漲吞沒", "看跌吞沒", "早晨之星", "黃昏之星", "MACD頂背離", "MACD底背離", "十字星"}
+    return any(p in key_patterns for p in patterns)
 
 # ------- DeepSeek 初判引擎 -------
-def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None, open_hour_ratio=None):
+def deepseek_judge_alert(symbol, hist, vol_ratio, force=False, turnover=None,
+                         open_hour_ratio=None, daily_trend=None, patterns=None, key_levels=None):
     data_text = hist.tail(24)[['Open','High','Low','Close','Volume']].to_string()
+    # 構建日線趨勢背景
+    trend_info = ""
+    if daily_trend:
+        trend_status = "多頭排列（日線收盤在MA20上方）" if daily_trend['above_ma20'] else "空頭排列（日線收盤在MA20下方）"
+        trend_info = f"\n日線趨勢：{trend_status}，日線MA20={daily_trend['ma20']:.2f}，日線收盤={daily_trend['close']:.2f}"
+    # 構建形態信息
+    pattern_info = f"\n代碼檢測到的K線形態：{', '.join(patterns) if patterns else '無明顯形態'}"
+    # 構建支撐壓力信息
+    level_info = ""
+    if key_levels:
+        level_info = f"\n關鍵支撐位：{key_levels['support']:.2f}（距當前價格{key_levels['dist_to_support']:.1f}%）"
+        level_info += f"\n關鍵壓力位：{key_levels['resistance']:.2f}（距當前價格{key_levels['dist_to_resistance']:.1f}%）"
     extra_info = ""
     if turnover is not None:
         extra_info += f"\n當前換手率：{turnover:.2f}%"
     if open_hour_ratio is not None:
-        extra_info += f"\n開盤第一小時量比（相對過去5日同時段均值）：{open_hour_ratio:.2f}"
-
+        extra_info += f"\n開盤第一小時量比：{open_hour_ratio:.2f}"
     if force:
-        hard_filter_block = "(用戶主動請求分析，忽略自動靜默閾值，但若以下硬指標未通過，請在 risk_factors 中註明，仍給出正常分析)"
+        filter_note = "（用戶主動請求分析，硬性過濾已跳過，但以下量化指標仍供參考）"
     else:
-        hard_filter_block = """## 硬性過濾規則（放寬版）
-請先執行以下檢查，根據結果調整置信度，但不強制攔截（除非完全無異動）：
-1. 若成交量倍數 < 1.5，且未出現明確反轉形態（頭肩底、雙底、楔形突破、早晨之星、鑷底等），請將置信度降低 15-20 點，並在 reason 中註明「量能偏弱」；若出現反轉形態，可維持原置信度。
-2. 若價格未突破過去20小時最高價，且未出現破位下跌，則設置 alert: false, confidence: 10, reason: "價格未突破前高，無突破訊號"（此條為硬性過濾，除非出現上述反轉形態可覆蓋）。
-3. 若換手率 > 5% 且價格漲幅 < 1%（滯漲），必須在 reason 中註明「派發風險」，但仍可繼續分析（alert 可為 true）"""
-
-    prompt = f"""你是頂級交易員，嚴格遵循下述規則進行分析。
-
-## 語言要求
-- 你必須全程使用**繁體中文（台灣/香港習慣）**回答所有文字欄位。
-
-## 認知誠實原則（指令約束）
-- 你必須僅基於下方給出的數據回答。如果某個判斷缺乏數據依據，必須在對應的欄位中註明「無數據支持」，並將該結論的置信度設置為 0。
-- 不允許編造趨勢、量價關係或形態，不允許假設數據之外的信息。若強行輸出無來源的信息，本次輸出將被視為無效。
-
-## 事實錨定要求
-在給出支撐位、壓力位、突破判斷、量價結論時，必須附帶信息來源標記。
-
-{hard_filter_block}
-
-## 趨勢摘要
-用一句話總結過去24小時的價格運行軌跡及當前位置。
-
-## 分析任務（僅當硬規則未觸發或已覆蓋時執行）
-- 判斷是否出現放量突破、斷崖下跌、關鍵反轉等非正常邏輯異動
-- 推算關鍵支撐位和壓力位（必須標明數據來源）
-- 輸出置信度（0-100%），並提供3個可能誤導判斷的風險因素
-- 當置信度 ≥ 80 時，你必須在 reason 中列舉至少3個相互印證的看多/看空訊號
-
-以下是 {symbol} 近 24 小時數據：
-{data_text}
-當前成交量是過去 20 小時均值的 {vol_ratio:.1f} 倍。{extra_info}
-
-嚴格輸出 JSON：
-{{"alert": true/false, "reason":"...", "support": "支撐價 [來源]", "resistance": "壓力價 [來源]", "confidence": 0-100, "risk_factors": ["風險1","風險2","風險3"], "trend_summary": "趨勢摘要"}}"""
-
+        filter_note = "（已通過代碼層硬性過濾，量價基礎條件已滿足）"
+    prompt = f"""你是頂級交易員，基於以下已計算好的量化指標進行分析。 ## 語言要求- 全程使用繁體中文（台灣/香港習慣）回答所有文字欄位。 ## 認知誠實原則（指令約束）- 僅基於下方給出的數據回答。缺乏數據依據的判斷必須註明「無數據支持」，置信度設為0。- 不允許編造趨勢、量價關係或形態。 ## 已計算的量化指標{filter_note}{trend_info}{pattern_info}{level_info}{extra_info} 以下是 {symbol} 近 24 小時數據：{data_text}當前成交量是過去 20 小時均值的 {vol_ratio:.1f} 倍。 ## 分析任務- 基於上述已計算好的形態、支撐壓力和趨勢數據，判斷是否存在有效信號- 結合日線趨勢判斷是順勢還是逆勢（逆勢信號置信度應大幅降低）- 輸出置信度（0-100%），並提供3個可能誤導判斷的風險因素- 當置信度 ≥ 80 時，必須列舉至少3個相互印證的看多/看空訊號 嚴格輸出 JSON：{{"alert": true/false, "action": "BUY/SELL/HOLD", "reason":"...", "support": "支撐價 [來源]", "resistance": "壓力價 [來源]", "confidence": 0-100, "risk_factors": ["風險1","風險2","風險3"], "trend_summary": "趨勢摘要"}}"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role":"user","content":prompt}],
@@ -303,18 +488,23 @@ def call_gemini_with_fallback(img_b64, symbol, trend_summary=""):
         result = gemini_vision_analysis(img_b64, symbol, trend_summary, model='gemini-2.5-flash')
         LAST_GEMINI_CALL_TIME = time.time()
         record_gemini_call()
+        LAST_GEMINI_ERROR.pop(symbol, None)
         return result
     except Exception as e:
         err_str = str(e)
+        LAST_GEMINI_ERROR[symbol] = err_str
         if '503' in err_str or 'UNAVAILABLE' in err_str:
             print(f"gemini-2.5-flash 不可用 (503)，回退到 gemini-2.0-flash...")
             try:
                 result = gemini_vision_analysis(img_b64, symbol, trend_summary, model='gemini-2.0-flash')
                 LAST_GEMINI_CALL_TIME = time.time()
                 record_gemini_call()
+                LAST_GEMINI_ERROR.pop(symbol, None)
                 return result
             except Exception as e2:
+                err2 = str(e2)
                 print(f"gemini-2.0-flash 也失败: {e2}")
+                LAST_GEMINI_ERROR[symbol] = err2
                 return None
         else:
             print(f"Gemini 视觉调用失败: {e}")
@@ -358,24 +548,31 @@ def call_vision_with_full_fallback(img_b64, symbol, trend_summary=""):
     if gemini_client:
         result = call_gemini_with_fallback(img_b64, symbol, trend_summary)
         if result:
+            LAST_GEMINI_ERROR.pop(symbol, None)
             return result
         print("Gemini 系列失败，尝试智譜备用引擎...")
     else:
         print("Gemini 未配置，直接尝试智譜视觉引擎...")
     if ZHIPU_API_KEY:
         print("正在调用智譜视觉模型...")
-        result = zhipu_vision_analysis(img_b64, symbol)
-        if result:
-            print("智譜视觉分析成功")
-            return result
-        else:
-            print("智譜视觉分析失败")
+        try:
+            result = zhipu_vision_analysis(img_b64, symbol)
+            if result:
+                print("智譜视觉分析成功")
+                LAST_GEMINI_ERROR.pop(symbol, None)
+                return result
+            else:
+                print("智譜视觉分析失败")
+                LAST_GEMINI_ERROR[symbol] = "智譜返回空結果"
+        except Exception as e:
+            LAST_GEMINI_ERROR[symbol] = str(e)
+            print(f"智譜视觉調用異常: {e}")
     else:
         print("未设置 ZHIPU_API_KEY，跳过备用视觉分析")
     return None
 
 # ------- 最終辯論與交易計劃生成 -------
-def deepseek_debate(symbol, initial_judge, gemini_vision):
+def deepseek_debate(symbol, initial_judge, gemini_vision, sentiment="暫無相關新聞"):
     if gemini_vision:
         expert_input = f"另一位專家（視覺分析）看完 K 線圖後指出：\n{gemini_vision}\n請結合視覺分析修正你的判斷。"
     else:
@@ -384,53 +581,36 @@ def deepseek_debate(symbol, initial_judge, gemini_vision):
     debate_prompt = f"""你是頂級交易員，正在對一份初始分析進行最終裁決。
 
 ## 語言要求
-- **重要：你必須完全使用繁體中文回覆所有 JSON 欄位。
+- **重要：你必須完全使用繁體中文回覆所有 JSON 欄位。**
 
 ## 認知誠實原則（指令約束）
-- 你必須僅基於量價數據、視覺分析結論以及風險因素進行判斷。
+- 你必須僅基於量價數據、視覺分析結論、新聞情緒以及風險因素進行判斷。
 - 如果某個操作建議缺乏直接的數據或圖形支撐，必須在 suggestion 中註明「該建議基於綜合經驗，缺乏直接量化指標」。
 - 不得編造未在上下文中出現的支撐/壓力位或趨勢。
 
-## 事實錨定要求
-最終輸出的 suggestion 必須指明其邏輯來源，例如：
+## 事實錨定要求最終輸出的 suggestion 必須指明其邏輯來源，例如：
 - "[基於純量價分析]"
 - "[基於視覺分析對假突破的確認]"
 - "[基於新聞情緒與量價共振]"
 
+## 新聞情緒參考{sentiment}
+
 ## 高級交易計劃要求
-你必須輸出一個完整的交易計劃，並在 suggestion 字串中**嚴格使用換行 (\n) 將以下每個要素獨立成行**：
+你必須輸出一個完整的交易計劃，並在 suggestion 字串中**嚴格使用換行 (\\n) 將以下每個要素獨立成行**：
 - 第一行：核心操作建議與方向（包括入場點、止損點、目標位、盈虧比結果，若低於 1:3 標註「博弈性價比低」）
 - 第二行：空間止損條件
 - 第三行：時間止損條件
-- 第四行：
+- 第四行：（空行）
 - 第五行：A路徑（達標）
 - 第六行：B路徑（失效）
 - 第七行：C路徑（橫盤）
 
-你之前對 {symbol} 的初步判斷是：
-{json.dumps(initial_judge, ensure_ascii=False)}
+你之前對 {symbol} 的初步判斷是：{json.dumps(initial_judge, ensure_ascii=False)}
 
 {expert_input}
 
-輸出最終結論，嚴格 JSON 格式（確保 Value 為繁體中文）：
-{{
-  "action": "BUY/SELL/HOLD",
-  "confidence": 0-100,
-  "signal_breakdown": {{
-    "price_action": "...",
-    "volume_confirmation": "...",
-    "visual_pattern": "若無視覺分析請填寫 '無視覺數據，基於純量價分析'"
-  }},
-  "risk_factors": ["..."],
-  "suggestion": "必須用換行分隔的六行交易計劃，範例格式：
-建議：基於純量價分析，建議在80.15附近買入，目標82.40，止損79.00，盈虧比1.96:1（低於3:1，博弈性價比低）
-空間止損：跌破79.00離場
-時間止損：若在80.00上方橫盤2個交易日無法拉回則失效
-
-A路徑（達標）：若站穩82.40，可加倉至84.00
-B路徑（失效）：若跌破79.00或時間止損觸發，訊號作廢
-C路徑（橫盤）：若在79.30-80.50震盪，建議持有最多3個交易日等待突破"
-}}"""
+輸出最終結論，嚴格 JSON 格式（確保 Value 為繁體中文）：{{  "action": "BUY/SELL/HOLD",  "confidence": 0-100,  "signal_breakdown": {{    "price_action": "...",    "volume_confirmation": "...",    "visual_pattern": "若無視覺分析請填寫 '無視覺數據，基於純量價分析'"  }},  "risk_factors": ["..."],  "suggestion": "必須用換行分隔的六行交易計劃"}}
+"""
     resp = deepseek.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role":"user","content":debate_prompt}],
@@ -438,7 +618,6 @@ C路徑（橫盤）：若在79.30-80.50震盪，建議持有最多3個交易日�
         response_format={"type":"json_object"}
     )
     return json.loads(resp.choices[0].message.content)
-
 # ------- 新聞情緒分析 -------
 def search_news(symbol):
     url = f"https://news.google.com/rss/search?q={symbol}+stock&hl=en-US&sort=date"
@@ -537,15 +716,37 @@ def check_telegram_commands():
 # ------- 強制分析函數 -------
 def force_analyze(symbol):
     try:
-        hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
+        hist, vol_ratio, turnover, open_hour_ratio, daily_trend = get_recent_data(symbol)
         if hist is None:
             send_telegram(f"❌ 無法取得 {symbol} 的數據，請檢查代號是否正確。")
             return
 
-        initial = deepseek_judge_alert(symbol, hist, vol_ratio, force=True, turnover=turnover, open_hour_ratio=open_hour_ratio)
+        # 計算量化指標
+        patterns = detect_patterns(hist)
+        key_levels = calculate_key_levels(hist)
 
+        # DeepSeek初判（force=True 跳過硬性過濾，但仍提供量化指標）
+        initial = deepseek_judge_alert(
+            symbol, hist, vol_ratio, force=True,
+            turnover=turnover,
+            open_hour_ratio=open_hour_ratio,
+            daily_trend=daily_trend,
+            patterns=patterns,
+            key_levels=key_levels
+        )
+
+        # 多時間框架趨勢過濾（僅標註，不攔截）
+        is_counter_trend, mtf_reason = mtf_trend_filter(initial.get('action', ''), daily_trend)
+        if is_counter_trend:
+            initial["reason"] = f"{initial.get('reason', '')} | ⚠️{mtf_reason}"
+
+        # 新聞情緒分析（前置）
+        news = search_news(symbol)
+        sentiment = deepseek_sentiment(symbol, news)
+
+        # 視覺分析（降低門檻至70，因為是用戶主動請求）
         gemini_vision = None
-        if (gemini_client or ZHIPU_API_KEY) and initial.get("confidence", 0) >= 80:
+        if (gemini_client or ZHIPU_API_KEY) and initial.get("confidence", 0) >= 70:
             if not should_skip_gemini(symbol, hist):
                 try:
                     img_b64 = generate_chart_b64(symbol, hist)
@@ -554,12 +755,23 @@ def force_analyze(symbol):
                     if gemini_vision:
                         LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
                 except Exception as e:
-                    print(f"强制分析视觉异常: {e}")
+                    print(f"強制分析視覺異常: {e}")
 
-        final = deepseek_debate(symbol, initial, gemini_vision)
+        # 最終辯論（結合情緒與視覺）
+        final = deepseek_debate(symbol, initial, gemini_vision, sentiment)
 
-        news = search_news(symbol)
-        sentiment = deepseek_sentiment(symbol, news)
+        # 盈虧比複核
+        final = check_risk_reward(final, key_levels)
+
+        # 視覺形態補充：若視覺未提供或置信度不足，顯示純量價說明或視覺錯誤原因
+        final.setdefault('signal_breakdown', {})
+        vis_pattern = final['signal_breakdown'].get('visual_pattern', '')
+        if not vis_pattern or vis_pattern.strip() == '':
+            if final.get('confidence', 0) < 80:
+                if symbol in LAST_GEMINI_ERROR:
+                    final['signal_breakdown']['visual_pattern'] = f"視覺模型失敗：{LAST_GEMINI_ERROR[symbol]}，因此基於純量價分析"
+                else:
+                    final['signal_breakdown']['visual_pattern'] = "由於置信度不足基於純量價分析"
 
         conf_val = final.get("confidence", 50)
         if conf_val >= 80:
@@ -569,7 +781,7 @@ def force_analyze(symbol):
         else:
             conf_tag = "🔴微弱信號"
 
-        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
+        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final.get("action"), "⚪")
         base_price = hist['Close'].iloc[-1]
 
         message = f"""
@@ -596,73 +808,7 @@ def force_analyze(symbol):
     except Exception as e:
         send_telegram(f"❌ 強制分析 {symbol} 時發生錯誤：{e}")
 
-# ------- 個股處理流程（供輪詢與全量掃描調用） -------
-def process_symbol(symbol, sheet):
-    try:
-        hist, vol_ratio, turnover, open_hour_ratio = get_recent_data(symbol)
-        if hist is None:
-            return
 
-        initial = deepseek_judge_alert(symbol, hist, vol_ratio, turnover=turnover, open_hour_ratio=open_hour_ratio)
-        if not initial.get("alert"):
-            return
-
-        confidence = initial.get("confidence", 50)
-        gemini_vision = None
-
-        if (gemini_client or ZHIPU_API_KEY) and confidence >= 70:
-            if not should_skip_gemini(symbol, hist):
-                try:
-                    img_b64 = generate_chart_b64(symbol, hist)
-                    trend_desc = initial.get("trend_summary", "")
-                    gemini_vision = call_vision_with_full_fallback(img_b64, symbol, trend_desc)
-                    if gemini_vision:
-                        LAST_GEMINI_ANALYSIS[symbol] = (time.time(), hist['Close'].iloc[-1])
-                except Exception as e:
-                    print(f"视觉分析流程异常: {e}")
-            else:
-                print(f"跳过 {symbol} 的视觉分析 (近期已分析且波动小)")
-
-        final = deepseek_debate(symbol, initial, gemini_vision)
-
-        news = search_news(symbol)
-        sentiment = deepseek_sentiment(symbol, news)
-
-        conf_val = final.get("confidence", 50)
-        if conf_val >= 80:
-            conf_tag = "🟢強信號"
-        elif conf_val >= 50:
-            conf_tag = "🟡弱信號（未經視覺驗證）"
-        else:
-            conf_tag = "🔴微弱信號"
-
-        action_emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(final["action"], "⚪")
-        base_price = hist['Close'].iloc[-1]
-
-        message = f"""
-🚨 *【{symbol}】異動預警* | 置信度：{conf_val}% {conf_tag}
-
-📊 *訊號拆解*
-  ▪ 價格行為：{final['signal_breakdown'].get('price_action','')}
-  ▪ 量能確認：{final['signal_breakdown'].get('volume_confirmation','')}
-  ▪ 圖形形態：{final['signal_breakdown'].get('visual_pattern','')}
-
-⚠️ *風險提示*
-  {chr(10).join(f'  {i+1}. {r}' for i, r in enumerate(final.get('risk_factors', [])))}
-
-📰 *新聞情緒*：{sentiment}
-
-{action_emoji} *建議*：
-{final.get('suggestion','')}
-
-🔑 *追蹤密鑰*：`{symbol} | 觀察中 | 基準價 {base_price:.2f}`
-"""
-        send_telegram(message.strip())
-        append_alert(sheet, symbol, conf_val, final.get('suggestion', ''), base_price)
-        time.sleep(1)
-
-    except Exception as e:
-        print(f"处理 {symbol} 时发生错误: {e}")
 
 # ------- 主程序入口 -------
 def main():
@@ -674,7 +820,6 @@ def main():
 
     # 3. 根据环境变量决定运行模式
     if MARKET in ("HK", "US"):
-        # 轮询模式：一次只处理一只股票
         if MARKET == "HK":
             STOCKS = STOCKS_HK
             INDEX_FILE = "current_index_hk.txt"
@@ -686,28 +831,33 @@ def main():
             print(f"⚠️ {MARKET} 股票清單為空，結束運行。")
             return
 
-        # 读取当前索引
+        # 讀取當前索引（增加容錯）
         current_index = 0
-        if os.path.exists(INDEX_FILE):
-            with open(INDEX_FILE, "r") as f:
-                try:
-                    current_index = int(f.read().strip())
-                except:
-                    pass
-        if current_index >= len(STOCKS):
+        try:
+            if os.path.exists(INDEX_FILE):
+                with open(INDEX_FILE, "r") as f:
+                    content = f.read().strip()
+                    if content:
+                        current_index = int(content)
+                    if current_index >= len(STOCKS) or current_index < 0:
+                        current_index = 0
+        except (ValueError, IOError) as e:
+            print(f"⚠️ 索引檔案讀取異常，重置為0: {e}")
             current_index = 0
 
         symbol = STOCKS[current_index]
         print(f"🎯 本次輪詢目標: {MARKET} - {symbol} (索引 {current_index})")
 
-        # 处理这只股票
         process_symbol(symbol, sheet)
 
-        # 更新索引并写入文件
+        # 更新索引（增加容錯）
         next_index = (current_index + 1) % len(STOCKS)
-        with open(INDEX_FILE, "w") as f:
-            f.write(str(next_index))
-        print(f"📝 索引已更新為 {next_index}")
+        try:
+            with open(INDEX_FILE, "w") as f:
+                f.write(str(next_index))
+            print(f"📝 索引已更新為 {next_index}")
+        except IOError as e:
+            print(f"⚠️ 索引檔案寫入失敗: {e}")
 
     else:
         # 兼容模式：全量扫描（手动触发时）
